@@ -2,6 +2,7 @@
 """
 Live Human Detection with GUI using YOLO 10
 Real-time human detection with position tracking and movement detection
+Integrated with Arduino motor control
 """
 
 import cv2
@@ -10,6 +11,226 @@ import time
 from ultralytics import YOLO
 from collections import deque
 import math
+import serial
+import threading
+from typing import Optional, Dict, Any
+
+class ArduinoMotorInterface:
+    def __init__(self, port: str = 'COM3', baud_rate: int = 115200, timeout: int = 1):
+        """
+        Initialize Arduino motor interface
+        
+        Args:
+            port: Serial port (e.g., 'COM3' on Windows, '/dev/ttyUSB0' on Linux)
+            baud_rate: Serial communication baud rate
+            timeout: Serial timeout in seconds
+        """
+        self.port = port
+        self.baud_rate = baud_rate
+        self.timeout = timeout
+        self.arduino: Optional[serial.Serial] = None
+        self.is_connected = False
+        self.last_command = None
+        self.command_lock = threading.Lock()
+        
+        # Motor command mappings
+        self.commands = {
+            'forward': 'F',
+            'backward': 'B', 
+            'left': 'L',
+            'right': 'R',
+            'forward_left': 'FL',
+            'forward_right': 'FR',
+            'stop': 'S'
+        }
+        
+        # Command aliases for different naming conventions
+        self.command_aliases = {
+            'fwd': 'forward',
+            'fwd_left': 'forward_left',
+            'fwd_right': 'forward_right',
+            'back': 'backward',
+            'turn_left': 'left',
+            'turn_right': 'right'
+        }
+    
+    def connect(self) -> bool:
+        """
+        Connect to Arduino via serial
+        
+        Returns:
+            bool: True if connection successful, False otherwise
+        """
+        try:
+            self.arduino = serial.Serial(
+                port=self.port,
+                baudrate=self.baud_rate,
+                timeout=self.timeout
+            )
+            
+            # Wait for Arduino to reset
+            time.sleep(2)
+            
+            # Clear any pending data
+            if self.arduino.in_waiting:
+                self.arduino.read(self.arduino.in_waiting)
+            
+            self.is_connected = True
+            print(f"Connected to Arduino on {self.port}")
+            return True
+            
+        except serial.SerialException as e:
+            print(f"Failed to connect to Arduino: {e}")
+            self.is_connected = False
+            return False
+    
+    def disconnect(self):
+        """Disconnect from Arduino"""
+        if self.arduino and self.arduino.is_open:
+            self.arduino.close()
+        self.is_connected = False
+        print("Disconnected from Arduino")
+    
+    def send_command(self, command: str) -> bool:
+        """
+        Send motor command to Arduino
+        
+        Args:
+            command: Motor command (e.g., 'forward', 'left', 'stop')
+            
+        Returns:
+            bool: True if command sent successfully, False otherwise
+        """
+        if not self.is_connected or not self.arduino:
+            print("Arduino not connected")
+            return False
+        
+        with self.command_lock:
+            try:
+                # Normalize command
+                command = command.lower().strip()
+                
+                # Check aliases
+                if command in self.command_aliases:
+                    command = self.command_aliases[command]
+                
+                # Get Arduino command
+                if command in self.commands:
+                    arduino_command = self.commands[command]
+                else:
+                    print(f"Unknown command: {command}")
+                    return False
+                
+                # Send command
+                self.arduino.write((arduino_command + '\n').encode())
+                self.last_command = command
+                
+                # Small delay for command processing
+                time.sleep(0.1)
+                
+                print(f"Sent command: {command} -> {arduino_command}")
+                return True
+                
+            except serial.SerialException as e:
+                print(f"Error sending command: {e}")
+                self.is_connected = False
+                return False
+    
+    def send_pwm_command(self, pwm_command: str) -> bool:
+        """
+        Send PWM command to Arduino
+        
+        Args:
+            pwm_command: PWM command string (e.g., 'PWM:200,200,F')
+            
+        Returns:
+            bool: True if command sent successfully, False otherwise
+        """
+        if not self.is_connected or not self.arduino:
+            print("Arduino not connected")
+            return False
+        
+        with self.command_lock:
+            try:
+                # Send PWM command directly
+                self.arduino.write((pwm_command + '\n').encode())
+                self.last_command = pwm_command
+                
+                # Small delay for command processing
+                time.sleep(0.1)
+                
+                print(f"Sent PWM command: {pwm_command}")
+                return True
+                
+            except serial.SerialException as e:
+                print(f"Error sending PWM command: {e}")
+                self.is_connected = False
+                return False
+    
+    def get_pwm_command_from_detection(self, detection: Dict[str, Any]) -> Optional[str]:
+        """
+        Convert detection data to PWM motor command with speed control
+        
+        Args:
+            detection: Detection data from the tracker
+            
+        Returns:
+            str: PWM command string or None if no action needed
+        """
+        if not detection:
+            return None
+        
+        # Extract position information
+        horizontal_pos = detection.get('position', 'center')
+        distance = detection.get('distance', 'GOOD DISTANCE')
+        movement = detection.get('movement', 'IDLE')
+        
+        # PWM speed settings based on distance
+        PWM_FAR = 200      # When person is far
+        PWM_IDLE = 150     # When person is at good distance (idle)
+        PWM_CLOSE = 0      # When person is too close (stop)
+        
+        # Determine PWM speed and direction based on distance
+        if distance == "TOO CLOSE":
+            # Too close - stop (PWM 0)
+            return f"PWM:{PWM_CLOSE},{PWM_CLOSE},S"
+        elif distance == "TOO FAR":
+            # Too far - move forward with high speed
+            if horizontal_pos == 'LEFT':
+                return f"PWM:{PWM_FAR//2},{PWM_FAR},F"  # Turn right while moving forward
+            elif horizontal_pos == 'RIGHT':
+                return f"PWM:{PWM_FAR},{PWM_FAR//2},F"  # Turn left while moving forward
+            else:
+                return f"PWM:{PWM_FAR},{PWM_FAR},F"     # Straight forward
+        elif distance == "GOOD DISTANCE":
+            # Good distance - adjust based on horizontal position
+            if horizontal_pos == 'LEFT':
+                return f"PWM:{PWM_IDLE//2},{PWM_IDLE},F"  # Turn right slowly
+            elif horizontal_pos == 'RIGHT':
+                return f"PWM:{PWM_IDLE},{PWM_IDLE//2},F"  # Turn left slowly
+            else:
+                # Center position - idle speed
+                if movement != 'IDLE':
+                    return f"PWM:{PWM_IDLE},{PWM_IDLE},F"  # Follow at idle speed
+                else:
+                    return f"PWM:{PWM_CLOSE},{PWM_CLOSE},S"  # Stop if no movement
+        else:
+            # Default - stop
+            return f"PWM:{PWM_CLOSE},{PWM_CLOSE},S"
+    
+    def emergency_stop(self):
+        """Emergency stop - immediately stop all motors"""
+        self.send_pwm_command("PWM:0,0,S")
+        print("EMERGENCY STOP executed")
+    
+    def __enter__(self):
+        """Context manager entry"""
+        self.connect()
+        return self
+    
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        """Context manager exit"""
+        self.disconnect()
 
 class PositionTracker:
     def __init__(self, history_length=10):
@@ -344,11 +565,11 @@ def get_command_color(command):
     else:
         return (255, 255, 255)  # White for default
 
-def draw_status_panel(frame, detections, frame_count, total_detections, fps):
-    """Draw status panel with position information, distance measurements, and robot commands"""
+def draw_status_panel(frame, detections, frame_count, total_detections, fps, motor_interface=None, arduino_connected=False):
+    """Draw status panel with position information, distance measurements, robot commands, and motor control"""
     # Create semi-transparent overlay
     overlay = frame.copy()
-    cv2.rectangle(overlay, (10, 10), (500, 350), (0, 0, 0), -1)
+    cv2.rectangle(overlay, (10, 10), (500, 400), (0, 0, 0), -1)  # Increased height for motor info
     cv2.addWeighted(overlay, 0.7, frame, 0.3, 0, frame)
     
     # Draw status information
@@ -441,9 +662,47 @@ def draw_status_panel(frame, detections, frame_count, total_detections, fps):
         if detection['distance'] == "TOO CLOSE":
             cv2.putText(frame, "⚠️ SAFETY STOP ACTIVATED", (20, y_offset), 
                        cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 255), 2)
+            y_offset += line_height
+        
+        # Motor control information
+        if arduino_connected and motor_interface:
+            pwm_command = motor_interface.get_pwm_command_from_detection(detection)
+            if pwm_command:
+                # Parse PWM command for display
+                if pwm_command.startswith("PWM:"):
+                    parts = pwm_command.split(',')
+                    if len(parts) >= 3:
+                        left_speed = parts[0].split(':')[1]
+                        right_speed = parts[1]
+                        direction = parts[2]
+                        
+                        cv2.putText(frame, f"Motor Control:", (20, y_offset), 
+                                   cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 255), 2)
+                        y_offset += line_height
+                        
+                        cv2.putText(frame, f"L: {left_speed} | R: {right_speed} | Dir: {direction}", (20, y_offset), 
+                                   cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 255), 2)
+                        y_offset += line_height
+                        
+                        # Show speed interpretation
+                        if left_speed == "0" and right_speed == "0":
+                            cv2.putText(frame, "Status: STOPPED", (20, y_offset), 
+                                       cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 255), 2)
+                        elif left_speed == "200" or right_speed == "200":
+                            cv2.putText(frame, "Status: HIGH SPEED", (20, y_offset), 
+                                       cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 2)
+                        else:
+                            cv2.putText(frame, "Status: IDLE SPEED", (20, y_offset), 
+                                       cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 0), 2)
     else:
         cv2.putText(frame, "No person detected", (20, y_offset), 
                    cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 255), 2)
+        y_offset += line_height
+        
+        # Motor status when no detection
+        if arduino_connected:
+            cv2.putText(frame, "Motor: STOPPED (no detection)", (20, y_offset), 
+                       cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 255), 2)
         y_offset += line_height
         cv2.putText(frame, "Robot: SEARCHING", (20, y_offset), 
                    cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 0), 2)
@@ -548,14 +807,32 @@ def draw_distance_indicators(frame, tracker):
             cv2.circle(frame, pt2, 3, color, -1)
 
 def main():
-    """Main function for live human detection with GUI"""
-    print("Live Human Detection with YOLO 10 - Position Tracking")
-    print("=" * 50)
+    """Main function for live human detection with GUI and motor control"""
+    print("Live Human Detection with YOLO 10 - Position Tracking + Motor Control")
+    print("=" * 60)
     print("Advanced human detection with position and movement tracking")
+    print("Integrated with Arduino motor control using PWM speed control")
     print("Loading YOLO 10 model...")
     
     # Initialize position tracker
     tracker = PositionTracker(history_length=15)
+    
+    # Initialize motor interface
+    motor_interface = ArduinoMotorInterface(port='COM3', baud_rate=115200)
+    
+    # Try to connect to Arduino
+    arduino_connected = motor_interface.connect()
+    if arduino_connected:
+        print("✅ Arduino motor control connected!")
+        print("Motor control features:")
+        print("- PWM speed control based on distance")
+        print("- Far distance: PWM 200 (high speed)")
+        print("- Good distance: PWM 150 (idle speed)")
+        print("- Too close: PWM 0 (stop)")
+        print("- Automatic direction control based on position")
+    else:
+        print("⚠️  Arduino not connected - running in detection-only mode")
+        print("Motor commands will be displayed but not sent")
     
     try:
         # Try to load YOLO 10 model
@@ -632,13 +909,23 @@ def main():
         # Draw distance indicators and movement trails
         draw_distance_indicators(frame, tracker)
         
+        # Process motor commands based on detection
+        if detections and arduino_connected:
+            detection = detections[0]  # Use first detection
+            pwm_command = motor_interface.get_pwm_command_from_detection(detection)
+            if pwm_command:
+                motor_interface.send_pwm_command(pwm_command)
+        
         # Draw status panel
         elapsed_time = time.time() - start_time
         fps = frame_count / elapsed_time if elapsed_time > 0 else 0
-        draw_status_panel(frame, detections, frame_count, total_detections, fps)
+        draw_status_panel(frame, detections, frame_count, total_detections, fps, motor_interface, arduino_connected)
         
         # Add instructions
-        cv2.putText(frame, "Press 'q' to quit | 'f' to toggle fullscreen | 'r' to reset size", (10, frame.shape[0] - 20), 
+        instructions = "Press 'q' to quit | 'f' to toggle fullscreen | 'r' to reset size"
+        if arduino_connected:
+            instructions += " | 's' for emergency stop"
+        cv2.putText(frame, instructions, (10, frame.shape[0] - 20), 
                    cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
         
         # Display the frame in full screen
@@ -655,17 +942,18 @@ def main():
             if detections:
                 detection = detections[0]
                 robot_command = get_robot_command(detection)
+                pwm_command = motor_interface.get_pwm_command_from_detection(detection) if arduino_connected else "NO ARDUINO"
                 real_distance = detection['estimated_real_distance_cm']
                 pixel_distance = detection['pixel_distance_to_center']
                 speed = detection['movement_speed_pixels_per_sec']
                 total_traveled = detection['total_distance_traveled']
                 
                 if real_distance is not None:
-                    print(f"Frame {frame_count}: {detection['position']} | {detection['distance']} | {detection['movement']} | Distance: {real_distance:.1f}cm | Speed: {speed:.1f}px/s | Total: {total_traveled:.1f}px | Robot: {robot_command} | FPS: {fps:.1f}")
+                    print(f"Frame {frame_count}: {detection['position']} | {detection['distance']} | {detection['movement']} | Distance: {real_distance:.1f}cm | Speed: {speed:.1f}px/s | Total: {total_traveled:.1f}px | Robot: {robot_command} | PWM: {pwm_command} | FPS: {fps:.1f}")
                 else:
-                    print(f"Frame {frame_count}: {detection['position']} | {detection['distance']} | {detection['movement']} | Pixel: {pixel_distance:.0f}px | Speed: {speed:.1f}px/s | Total: {total_traveled:.1f}px | Robot: {robot_command} | FPS: {fps:.1f}")
+                    print(f"Frame {frame_count}: {detection['position']} | {detection['distance']} | {detection['movement']} | Pixel: {pixel_distance:.0f}px | Speed: {speed:.1f}px/s | Total: {total_traveled:.1f}px | Robot: {robot_command} | PWM: {pwm_command} | FPS: {fps:.1f}")
             else:
-                print(f"Frame {frame_count}: No detection | Robot: SEARCHING | FPS: {fps:.1f}")
+                print(f"Frame {frame_count}: No detection | Robot: SEARCHING | PWM: PWM:0,0,S | FPS: {fps:.1f}")
         
         # Handle key presses
         key = cv2.waitKey(1) & 0xFF
@@ -680,9 +968,18 @@ def main():
         elif key == ord('r'):  # Reset window size
             cv2.setWindowProperty('Live Human Detection - Position Tracking', cv2.WND_PROP_FULLSCREEN, cv2.WINDOW_NORMAL)
             cv2.resizeWindow('Live Human Detection - Position Tracking', 1280, 720)
+        elif key == ord('s') and arduino_connected:  # Emergency stop
+            motor_interface.emergency_stop()
+            print("EMERGENCY STOP triggered by 's' key")
     
     cap.release()
     cv2.destroyAllWindows()
+    
+    # Emergency stop and disconnect motor interface
+    if arduino_connected:
+        motor_interface.emergency_stop()
+        motor_interface.disconnect()
+        print("Motor control disconnected")
     
     # Print final statistics
     elapsed_time = time.time() - start_time
