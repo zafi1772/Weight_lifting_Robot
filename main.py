@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """
-Live Human Detection with GUI using YOLO 10
+Live Human Detection with GUI using YOLO 10 - Raspberry Pi 4 Optimized
 Real-time human detection with position tracking and movement detection
-Integrated with Arduino motor control
+Integrated with Arduino motor control for Raspberry Pi 4 (4GB RAM)
 """
 
 import cv2
@@ -14,14 +14,25 @@ import math
 import serial
 import threading
 from typing import Optional, Dict, Any
+import os
+import platform
+
+# Raspberry Pi specific imports
+try:
+    import picamera
+    from picamera.array import PiRGBArray
+    PI_CAMERA_AVAILABLE = True
+except ImportError:
+    PI_CAMERA_AVAILABLE = False
+    print("PiCamera not available, using USB camera")
 
 class ArduinoMotorInterface:
-    def __init__(self, port: str = 'COM3', baud_rate: int = 115200, timeout: int = 1):
+    def __init__(self, port: str = '/dev/ttyUSB0', baud_rate: int = 115200, timeout: int = 1):
         """
-        Initialize Arduino motor interface
+        Initialize Arduino motor interface for Raspberry Pi
         
         Args:
-            port: Serial port (e.g., 'COM3' on Windows, '/dev/ttyUSB0' on Linux)
+            port: Serial port (e.g., '/dev/ttyUSB0' or '/dev/ttyACM0' on Raspberry Pi)
             baud_rate: Serial communication baud rate
             timeout: Serial timeout in seconds
         """
@@ -56,33 +67,50 @@ class ArduinoMotorInterface:
     
     def connect(self) -> bool:
         """
-        Connect to Arduino via serial
-        
-        Returns:
-            bool: True if connection successful, False otherwise
+        Connect to Arduino via serial with Raspberry Pi port detection
         """
-        try:
-            self.arduino = serial.Serial(
-                port=self.port,
-                baudrate=self.baud_rate,
-                timeout=self.timeout
-            )
-            
-            # Wait for Arduino to reset
-            time.sleep(2)
-            
-            # Clear any pending data
-            if self.arduino.in_waiting:
-                self.arduino.read(self.arduino.in_waiting)
-            
-            self.is_connected = True
-            print(f"Connected to Arduino on {self.port}")
-            return True
-            
-        except serial.SerialException as e:
-            print(f"Failed to connect to Arduino: {e}")
-            self.is_connected = False
-            return False
+        # Try common Raspberry Pi serial ports
+        possible_ports = [
+            '/dev/ttyUSB0',
+            '/dev/ttyUSB1', 
+            '/dev/ttyACM0',
+            '/dev/ttyACM1',
+            '/dev/ttyS0',
+            '/dev/ttyS1'
+        ]
+        
+        # If specific port provided, try it first
+        if self.port not in possible_ports:
+            possible_ports.insert(0, self.port)
+        
+        for port in possible_ports:
+            try:
+                if os.path.exists(port):
+                    self.arduino = serial.Serial(
+                        port=port,
+                        baudrate=self.baud_rate,
+                        timeout=self.timeout
+                    )
+                    
+                    # Wait for Arduino to reset
+                    time.sleep(2)
+                    
+                    # Clear any pending data
+                    if self.arduino.in_waiting:
+                        self.arduino.read(self.arduino.in_waiting)
+                    
+                    self.is_connected = True
+                    self.port = port  # Update to actual port used
+                    print(f"Connected to Arduino on {port}")
+                    return True
+                    
+            except serial.SerialException as e:
+                print(f"Failed to connect on {port}: {e}")
+                continue
+        
+        print("Failed to connect to Arduino on any available port")
+        self.is_connected = False
+        return False
     
     def disconnect(self):
         """Disconnect from Arduino"""
@@ -231,6 +259,98 @@ class ArduinoMotorInterface:
     def __exit__(self, exc_type, exc_val, exc_tb):
         """Context manager exit"""
         self.disconnect()
+
+class PiCameraInterface:
+    """Raspberry Pi Camera interface with optimized settings for Pi 4"""
+    
+    def __init__(self, resolution=(640, 480), framerate=30):
+        self.camera = None
+        self.raw_capture = None
+        self.resolution = resolution
+        self.framerate = framerate
+        self.is_pi_camera = False
+        
+    def initialize(self):
+        """Initialize camera (PiCamera or USB camera)"""
+        if PI_CAMERA_AVAILABLE:
+            try:
+                self.camera = picamera.PiCamera()
+                self.camera.resolution = self.resolution
+                self.camera.framerate = self.framerate
+                self.camera.rotation = 0
+                
+                # Optimize for Pi 4 performance
+                self.camera.exposure_mode = 'auto'
+                self.camera.awb_mode = 'auto'
+                self.camera.meter_mode = 'average'
+                
+                # Reduce memory usage
+                self.camera.video_stabilization = False
+                self.camera.image_effect = 'none'
+                
+                self.raw_capture = PiRGBArray(self.camera, size=self.resolution)
+                self.is_pi_camera = True
+                print(f"PiCamera initialized: {self.resolution[0]}x{self.resolution[1]} @ {self.framerate}fps")
+                return True
+                
+            except Exception as e:
+                print(f"PiCamera initialization failed: {e}")
+                self.is_pi_camera = False
+        
+        # Fallback to USB camera
+        try:
+            self.camera = cv2.VideoCapture(0)
+            if not self.camera.isOpened():
+                # Try different camera indices
+                for i in range(4):
+                    self.camera = cv2.VideoCapture(i)
+                    if self.camera.isOpened():
+                        break
+            
+            if self.camera.isOpened():
+                # Set camera properties for Pi optimization
+                self.camera.set(cv2.CAP_PROP_FRAME_WIDTH, self.resolution[0])
+                self.camera.set(cv2.CAP_PROP_FRAME_HEIGHT, self.resolution[1])
+                self.camera.set(cv2.CAP_PROP_FPS, self.framerate)
+                self.camera.set(cv2.CAP_PROP_BUFFERSIZE, 1)  # Reduce buffer size
+                
+                # Get actual resolution
+                actual_width = int(self.camera.get(cv2.CAP_PROP_FRAME_WIDTH))
+                actual_height = int(self.camera.get(cv2.CAP_PROP_FRAME_HEIGHT))
+                print(f"USB Camera initialized: {actual_width}x{actual_height}")
+                return True
+            else:
+                print("Failed to initialize USB camera")
+                return False
+                
+        except Exception as e:
+            print(f"Camera initialization error: {e}")
+            return False
+    
+    def read(self):
+        """Read frame from camera"""
+        if self.is_pi_camera and self.camera:
+            try:
+                frame = self.camera.capture_continuous(self.raw_capture, format="bgr", use_video_port=True)
+                image = next(frame)
+                self.raw_capture.truncate(0)
+                return True, image.array
+            except Exception as e:
+                print(f"PiCamera read error: {e}")
+                return False, None
+        elif self.camera:
+            return self.camera.read()
+        else:
+            return False, None
+    
+    def release(self):
+        """Release camera resources"""
+        if self.is_pi_camera and self.camera:
+            self.camera.close()
+        elif self.camera:
+            self.camera.release()
+        self.camera = None
+        self.raw_capture = None
 
 class PositionTracker:
     def __init__(self, history_length=10):
@@ -807,18 +927,24 @@ def draw_distance_indicators(frame, tracker):
             cv2.circle(frame, pt2, 3, color, -1)
 
 def main():
-    """Main function for live human detection with GUI and motor control"""
-    print("Live Human Detection with YOLO 10 - Position Tracking + Motor Control")
-    print("=" * 60)
+    """Main function for live human detection with GUI and motor control - Raspberry Pi 4 Optimized"""
+    print("Live Human Detection with YOLO 10 - Raspberry Pi 4 Optimized")
+    print("=" * 70)
     print("Advanced human detection with position and movement tracking")
     print("Integrated with Arduino motor control using PWM speed control")
+    print("Optimized for Raspberry Pi 4 (4GB RAM)")
     print("Loading YOLO 10 model...")
     
-    # Initialize position tracker
-    tracker = PositionTracker(history_length=15)
+    # Check system information
+    print(f"Platform: {platform.system()} {platform.release()}")
+    print(f"Architecture: {platform.machine()}")
+    print(f"Python: {platform.python_version()}")
     
-    # Initialize motor interface
-    motor_interface = ArduinoMotorInterface(port='COM3', baud_rate=115200)
+    # Initialize position tracker with reduced history for memory optimization
+    tracker = PositionTracker(history_length=10)
+    
+    # Initialize motor interface for Raspberry Pi
+    motor_interface = ArduinoMotorInterface(port='/dev/ttyUSB0', baud_rate=115200)
     
     # Try to connect to Arduino
     arduino_connected = motor_interface.connect()
@@ -862,7 +988,7 @@ def main():
     print("- Movement direction in degrees")
     print("- Movement trails visualization")
     print("- Real-time guidance zones")
-    print("- Full screen display")
+    print("- Optimized for Pi 4 performance")
     print()
     print("Controls:")
     print("- Press 'q' to quit")
@@ -870,21 +996,12 @@ def main():
     print("- Press 'r' to reset window size")
     print()
     
-    # Initialize camera
-    cap = cv2.VideoCapture(0)
+    # Initialize Pi camera interface with optimized settings
+    camera_interface = PiCameraInterface(resolution=(640, 480), framerate=30)
     
-    if not cap.isOpened():
-        print("Error: Could not open camera")
+    if not camera_interface.initialize():
+        print("Error: Could not initialize camera")
         return
-    
-    # Set camera to high resolution
-    cap.set(cv2.CAP_PROP_FRAME_WIDTH, 1920)
-    cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 1080)
-    
-    # Get actual camera resolution
-    actual_width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
-    actual_height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
-    print(f"Camera resolution: {actual_width}x{actual_height}")
     
     print("Starting live human detection with position tracking...")
     print("Move around to test different positions and movements!")
@@ -893,12 +1010,52 @@ def main():
     total_detections = 0
     start_time = time.time()
     
+    # Performance optimization: reduce detection frequency for Pi 4
+    detection_interval = 3  # Process every 3rd frame
+    frame_skip_counter = 0
+    
     while True:
-        ret, frame = cap.read()
+        ret, frame = camera_interface.read()
         
         if not ret:
             print("Failed to grab frame")
             break
+        
+        # Skip frames for performance optimization on Pi 4
+        frame_skip_counter += 1
+        if frame_skip_counter % detection_interval != 0:
+            # Still display frame but skip detection
+            draw_guidance_zones(frame)
+            draw_status_panel(frame, [], frame_count, total_detections, 0, motor_interface, arduino_connected)
+            
+            # Add instructions
+            instructions = "Press 'q' to quit | 'f' to toggle fullscreen | 'r' to reset size"
+            if arduino_connected:
+                instructions += " | 's' for emergency stop"
+            cv2.putText(frame, instructions, (10, frame.shape[0] - 20), 
+                       cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
+            
+            # Display frame
+            cv2.imshow('Live Human Detection - Pi 4 Optimized', frame)
+            frame_count += 1
+            
+            # Handle key presses
+            key = cv2.waitKey(1) & 0xFF
+            if key == ord('q'):
+                break
+            elif key == ord('f'):
+                current_prop = cv2.getWindowProperty('Live Human Detection - Pi 4 Optimized', cv2.WND_PROP_FULLSCREEN)
+                if current_prop == cv2.WINDOW_FULLSCREEN:
+                    cv2.setWindowProperty('Live Human Detection - Pi 4 Optimized', cv2.WND_PROP_FULLSCREEN, cv2.WINDOW_NORMAL)
+                else:
+                    cv2.setWindowProperty('Live Human Detection - Pi 4 Optimized', cv2.WND_PROP_FULLSCREEN, cv2.WINDOW_FULLSCREEN)
+            elif key == ord('r'):
+                cv2.setWindowProperty('Live Human Detection - Pi 4 Optimized', cv2.WND_PROP_FULLSCREEN, cv2.WINDOW_NORMAL)
+                cv2.resizeWindow('Live Human Detection - Pi 4 Optimized', 640, 480)
+            elif key == ord('s') and arduino_connected:
+                motor_interface.emergency_stop()
+                print("EMERGENCY STOP triggered by 's' key")
+            continue
         
         # Draw guidance zones
         draw_guidance_zones(frame)
@@ -928,10 +1085,8 @@ def main():
         cv2.putText(frame, instructions, (10, frame.shape[0] - 20), 
                    cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
         
-        # Display the frame in full screen
-        cv2.namedWindow('Live Human Detection - Position Tracking', cv2.WINDOW_NORMAL)
-        cv2.setWindowProperty('Live Human Detection - Position Tracking', cv2.WND_PROP_FULLSCREEN, cv2.WINDOW_FULLSCREEN)
-        cv2.imshow('Live Human Detection - Position Tracking', frame)
+        # Display the frame (no fullscreen by default for Pi performance)
+        cv2.imshow('Live Human Detection - Pi 4 Optimized', frame)
         
         # Update statistics
         total_detections += len(detections)
@@ -960,19 +1115,19 @@ def main():
         if key == ord('q'):
             break
         elif key == ord('f'):  # Toggle fullscreen
-            current_prop = cv2.getWindowProperty('Live Human Detection - Position Tracking', cv2.WND_PROP_FULLSCREEN)
+            current_prop = cv2.getWindowProperty('Live Human Detection - Pi 4 Optimized', cv2.WND_PROP_FULLSCREEN)
             if current_prop == cv2.WINDOW_FULLSCREEN:
-                cv2.setWindowProperty('Live Human Detection - Position Tracking', cv2.WND_PROP_FULLSCREEN, cv2.WINDOW_NORMAL)
+                cv2.setWindowProperty('Live Human Detection - Pi 4 Optimized', cv2.WND_PROP_FULLSCREEN, cv2.WINDOW_NORMAL)
             else:
-                cv2.setWindowProperty('Live Human Detection - Position Tracking', cv2.WND_PROP_FULLSCREEN, cv2.WINDOW_FULLSCREEN)
+                cv2.setWindowProperty('Live Human Detection - Pi 4 Optimized', cv2.WND_PROP_FULLSCREEN, cv2.WINDOW_FULLSCREEN)
         elif key == ord('r'):  # Reset window size
-            cv2.setWindowProperty('Live Human Detection - Position Tracking', cv2.WND_PROP_FULLSCREEN, cv2.WINDOW_NORMAL)
-            cv2.resizeWindow('Live Human Detection - Position Tracking', 1280, 720)
+            cv2.setWindowProperty('Live Human Detection - Pi 4 Optimized', cv2.WND_PROP_FULLSCREEN, cv2.WINDOW_NORMAL)
+            cv2.resizeWindow('Live Human Detection - Pi 4 Optimized', 640, 480)
         elif key == ord('s') and arduino_connected:  # Emergency stop
             motor_interface.emergency_stop()
             print("EMERGENCY STOP triggered by 's' key")
     
-    cap.release()
+    camera_interface.release()
     cv2.destroyAllWindows()
     
     # Emergency stop and disconnect motor interface
