@@ -1,19 +1,6 @@
-# Core dependencies for human detection and motor control
-opencv-python>=4.8.0
-ultralytics>=8.0.0
-numpy>=1.24.0
+ultralytics>=8.3.0
+opencv-python>=4.7.0
+torch>=2.0.0
+torchvision>=0.15.0
 pyserial>=3.5
-
-# Raspberry Pi specific dependencies
-picamera2>=0.3.0  # For PiCamera v2/v3 support
-picamera>=1.13  # Legacy PiCamera support
-
-# Performance optimization for Pi 4
-# Note: These versions are optimized for ARM architecture
-opencv-contrib-python>=4.8.0  # Full OpenCV with contrib modules
-Pillow>=10.0.0  # Image processing
-matplotlib>=3.7.0  # For plotting (optional)
-
-# Additional utilities for Pi
-psutil>=5.9.0  # System monitoring
-GPIO>=0.7.0  # GPIO access (if needed)
+pygame>=2.5.0

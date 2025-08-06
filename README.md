@@ -1,261 +1,181 @@
-# Following Robot - Live Human Detection & Tracking with Motor Control
+# 🤖 Following Robot
 
-A real-time human detection and tracking system using YOLO 10 with advanced position tracking, distance measurement, robot guidance capabilities, and integrated Arduino motor control using PWM speed control. **Optimized for Raspberry Pi 4 (4GB RAM)**.
+A real-time human detection and following robot system using YOLO and OpenCV.
 
 ## 🚀 Features
 
-### Core Detection
-- **Real-time human detection** using YOLO 10 (with YOLO 8 fallback)
-- **Position tracking** (LEFT, CENTER, RIGHT zones)
-- **Movement detection** (GOING LEFT, GOING RIGHT, GOING UP, GOING DOWN, IDLE)
-- **Real-world distance estimation** in centimeters
-- **Pixel distance measurement** from frame center
-
-### Advanced Analytics
-- **Movement speed tracking** (pixels/second)
-- **Total distance traveled** calculation
-- **Movement direction** in degrees
-- **Movement trails visualization**
-- **Historical position tracking** (15-frame history)
-
-### Safety & Guidance
-- **Safety zones** with real-world distance thresholds:
-  - **TOO CLOSE**: < 29 cm (Safety stop)
-  - **GOOD DISTANCE**: 29-31 cm (Optimal following)
-  - **TOO FAR**: > 31 cm (Move forward)
-- **Real-time guidance zones** visualization
-- **Robot command generation** based on position and distance
-- **Safety stop activation** when too close
-
-### Motor Control Integration
-- **Arduino motor control** using L298N motor driver
-- **PWM speed control** based on detection distance:
-  - **Far distance**: PWM 200 (high speed)
-  - **Good distance**: PWM 150 (idle speed)
-  - **Too close**: PWM 0 (stop)
-- **Automatic direction control** based on horizontal position
-- **Emergency stop** functionality
-- **Serial communication** with Arduino (115200 baud)
-
-### User Interface
-- **Full-screen display** with toggle capability
-- **Real-time status panel** with comprehensive metrics
-- **Color-coded bounding boxes** based on position and distance
-- **Distance indicators** and movement trails
-- **Live FPS monitoring**
-
-### Raspberry Pi Optimization
-- **PiCamera support** (v2/v3) with automatic fallback to USB camera
-- **Frame skipping** for improved performance on Pi 4
-- **Memory optimization** with reduced history length
-- **ARM-optimized dependencies** for better performance
-- **Automatic serial port detection** for Arduino connection
+- **Real-time Human Detection**: Uses YOLO (YOLOv8/YOLOv10) for accurate person detection
+- **Smart Following**: Robot follows person based on position and distance
+- **Percentage-based Positioning**: Shows detailed left/right position with percentages
+- **Distance-based Speed Control**: Adjusts speed based on distance to person
+- **Arduino Motor Control**: Serial communication with L298N motor driver
+- **Elevator Music**: Plays mild background music when person is idle (not moving)
 
 ## 📋 Requirements
 
-### Hardware
-- **Raspberry Pi 4 (4GB RAM recommended)**
-- Camera (PiCamera v2/v3 or USB camera)
-- Arduino Uno/Nano/Mega (for motor control)
-- L298N Motor Driver Module
-- 2x 12V DC Motors
-- 12V Power Supply
-
-### Software
-- **Raspberry Pi OS (Bullseye or newer)**
-- Python 3.8+
-- YOLO model file (`yolov10n.pt` or `yolov8n.pt`)
+- Python 3.8+ (tested with Python 3.13)
+- Webcam
+- Arduino with L298N motor driver
+- YOLO model file (yolov8n.pt or yolov10n.pt)
 
 ## 🛠️ Installation
 
-### Quick Setup (Raspberry Pi)
-1. **Clone or download** this repository to your Raspberry Pi
-2. **Run the setup script**:
-   ```bash
-   chmod +x setup_pi.sh
-   ./setup_pi.sh
-   ```
-3. **Reboot** your Raspberry Pi:
-   ```bash
-   sudo reboot
-   ```
+1. **Clone or download the project files**
 
-### Manual Setup
-1. **Clone or download** this repository
-2. **Install dependencies**:
+2. **Install Python dependencies**:
    ```bash
    pip install -r requirements.txt
    ```
 
-3. **Download YOLO model** (if not included):
-   - The system will automatically try to use `yolov10n.pt`
-   - Falls back to `yolov8n.pt` if YOLO 10 is not available
-   - You can download models from [Ultralytics](https://github.com/ultralytics/ultralytics)
+3. **Download YOLO model** (if not already present):
+   ```bash
+   # The system will automatically download yolov8n.pt if not found
+   ```
 
-### Raspberry Pi Configuration
-The setup script automatically:
-- Enables camera interface
-- Enables I2C and SPI interfaces
-- Configures serial communication for Arduino
-- Sets up udev rules for Arduino access
-- Creates a virtual environment
-- Installs ARM-optimized dependencies
+4. **Upload Arduino code**:
+   - Open `arduino_motor_control.ino` in Arduino IDE
+   - Upload to your Arduino board
+
+## 🔧 Hardware Setup
+
+### Arduino Pin Connections (L298N):
+- **ENA** → Pin 3 (PWM)
+- **IN1** → Pin 2
+- **IN2** → Pin 4
+- **IN3** → Pin 6
+- **IN4** → Pin 7
+- **ENB** → Pin 5 (PWM)
+
+### Motor Connections:
+- **Motor A**: Left motor
+- **Motor B**: Right motor
 
 ## 🎮 Usage
 
-### Basic Usage
+### Basic Usage:
 ```bash
-# On Raspberry Pi (after setup)
-./start_robot.sh
-
-# Or manually
-python3 main.py
+python main.py
 ```
 
-### Controls
-- **'q'** - Quit the application
-- **'f'** - Toggle fullscreen mode
-- **'r'** - Reset window size to 1280x720
-- **'s'** - Emergency stop (when Arduino connected)
-
-### Robot Commands Generated
-The system generates robot commands based on detected positions:
-
-| Position | Distance | Movement | Robot Command |
-|----------|----------|----------|---------------|
-| Any | TOO CLOSE | Any | STOP - TOO CLOSE |
-| Any | TOO FAR | Any | MOVE FORWARD |
-| LEFT | GOOD DISTANCE | Any | TURN LEFT |
-| RIGHT | GOOD DISTANCE | Any | TURN RIGHT |
-| CENTER | GOOD DISTANCE | GOING LEFT | TURN LEFT SLOWLY |
-| CENTER | GOOD DISTANCE | GOING RIGHT | TURN RIGHT SLOWLY |
-| CENTER | GOOD DISTANCE | IDLE | FOLLOW - CENTER |
-
-## 🔧 Technical Details
-
-### Distance Estimation
-The system uses bounding box size to estimate real-world distance:
-- **Reference**: 200 pixels = 100 cm at known distance
-- **Average person height**: 170 cm
-- **Inverse relationship**: `distance = known_distance * (known_height / current_height)`
-
-### Position Analysis
-- **Horizontal zones**: Frame divided into 3 equal sections
-- **Distance zones**: Based on real-world distance thresholds
-- **Movement detection**: Uses 3-frame history with 20-pixel threshold
-
-### Performance Features
-- **High-resolution camera support** (up to 1920x1080)
-- **Efficient YOLO inference** with confidence threshold of 0.3
-- **Real-time processing** with FPS monitoring
-- **Memory-efficient position history** (15-frame deque)
-- **Raspberry Pi optimization** with frame skipping and reduced resolution
-
-## 📊 Output Information
-
-### Real-time Display
-- **Detection count** and frame statistics
-- **Position analysis** (LEFT/CENTER/RIGHT)
-- **Distance status** (TOO CLOSE/GOOD DISTANCE/TOO FAR)
-- **Movement direction** and speed
-- **Real-world distance** in centimeters
-- **Pixel distance** from center
-- **Movement metrics** (speed, total traveled, direction)
-- **Robot command** with color coding
-
-### Console Output
-Every 30 frames, the system prints:
-```
-Frame 30: CENTER | GOOD DISTANCE | IDLE | Distance: 30.2cm | Speed: 5.1px/s | Total: 45.3px | Robot: FOLLOW - CENTER | PWM: PWM:150,150,F | FPS: 25.3
+### Advanced Usage:
+```bash
+python main.py --source 0 --model yolov8n.pt --conf 0.4 --serial_port COM3
 ```
 
-### Motor Control Commands
-The system sends PWM commands to Arduino based on detection:
-- **PWM:200,200,F** - High speed forward (person far)
-- **PWM:150,150,F** - Idle speed forward (person at good distance)
-- **PWM:0,0,S** - Stop (person too close or no detection)
-- **PWM:100,200,F** - Turn right while moving forward
-- **PWM:200,100,F** - Turn left while moving forward
+### Command Line Options:
+- `--source`: Camera index or video file (default: 0)
+- `--model`: YOLO model path (default: yolov8n.pt)
+- `--conf`: Confidence threshold (default: 0.4)
+- `--close_cm`: Close distance threshold in cm (default: 340)
+- `--far_cm`: Far distance threshold in cm (default: 455)
+- `--serial_port`: Arduino serial port (default: COM3)
+- `--baud_rate`: Serial baud rate (default: 9600)
 
-## 🎯 Use Cases
 
-- **Robot following systems** - Autonomous robots that follow humans
-- **Social robotics** - Human-robot interaction applications
-- **Security systems** - Human tracking and monitoring
-- **Research platforms** - Computer vision and robotics research
-- **Educational projects** - Learning computer vision and AI
-- **Physical robot control** - Direct motor control for mobile robots
-- **Automated following vehicles** - Self-driving following robots
 
-## 🔍 Troubleshooting
+## 🎵 Elevator Music
 
-### Common Issues
+### Music Control:
+- **Person Idle**: Plays mild elevator music from "Elevator Music - aeiouFU.mp3"
+- **Person Moving**: Stops music automatically
+- **No Person**: Stops music automatically
+- **Volume**: Mild (30% volume) for background ambiance
 
-1. **Camera not found**:
-   - Ensure webcam is connected and not in use by other applications
-   - Try different camera indices (0, 1, 2, etc.)
+### Music Features:
+- **Real Elevator Music**: Uses actual elevator music file for authentic sound
+- **Continuous Loop**: Music loops seamlessly while person is idle
+- **Non-intrusive**: Moderate volume for pleasant background ambiance
+- **Automatic Control**: Starts/stops based on person's movement state
+- **Thread-safe**: Plays in background without blocking detection
 
-2. **YOLO model not found**:
-   - Download the model file manually
-   - The system will automatically fall back to YOLO 8 if YOLO 10 is unavailable
+## 🎯 Motor Control Logic
 
-3. **Low FPS**:
-   - Reduce camera resolution
-   - Use a smaller YOLO model (e.g., `yolov8n.pt` instead of `yolov10n.pt`)
-   - Ensure GPU acceleration is available
+### Speed Control:
+- **Idle Distance**: Speed 6
+- **Far Distance**: Speed 8
+- **Close Distance**: Stop (Safety)
 
-4. **Inaccurate distance estimation**:
-   - Calibrate the system for your specific camera and environment
-   - Adjust the reference values in the `PositionTracker` class
+### Movement Commands:
+- **Center + Far**: Forward (F)
+- **Center + Idle**: Forward (F)
+- **Left positions**: Forward-Right (I)
+- **Right positions**: Forward-Left (G)
+- **Close distance**: Stop (S)
 
-5. **Arduino connection issues**:
-   - Check COM port (Windows) or device path (Linux/Raspberry Pi)
-   - On Raspberry Pi, check `/dev/ttyUSB0`, `/dev/ttyACM0`, etc.
-   - Verify baud rate is set to 115200
-   - Ensure Arduino is not connected to Arduino IDE Serial Monitor
-   - Check USB cable and drivers
-   - Run `lsusb` to see connected USB devices
+## 📊 Visual Feedback
 
-6. **Motor control problems**:
-   - Verify L298N wiring connections
-   - Check power supply voltage and current rating
-   - Test motors individually
-   - Review the `L298N_Wiring_Guide.md` for detailed setup instructions
+The system displays:
+- Person bounding box with position info
+- Distance measurement in cm
+- Movement state (Moving/Idle)
+- Motor command being sent
+- Following status (ON/OFF)
+- Music status (ON/OFF when person is idle)
 
-7. **Raspberry Pi specific issues**:
-   - Check camera: `vcgencmd get_camera`
-   - Check serial ports: `ls -la /dev/tty*`
-   - Check USB devices: `lsusb`
-   - Ensure camera interface is enabled: `sudo raspi-config`
-   - Check system temperature: `vcgencmd measure_temp`
-   - Monitor memory usage: `free -h`
+## 🧪 Testing
+
+### Test Camera:
+```bash
+python test_camera.py
+```
+
+### Test Elevator Music:
+```bash
+python test_elevator_music.py
+```
+
+## 🔧 Troubleshooting
+
+### Common Issues:
+
+1. **Camera not working**:
+   - Check camera permissions
+   - Try different camera index: `--source 1`
+
+2. **Serial connection failed**:
+   - Check Arduino is connected
+   - Verify correct COM port
+   - Ensure Arduino code is uploaded
+
+3. **Finger detection not accurate**:
+   - Improve lighting conditions
+   - Keep hand steady
+   - Ensure hand is clearly visible
+
+4. **Robot not following properly**:
+   - Check motor connections
+   - Verify Arduino code
+   - Adjust distance thresholds
+
+### Performance Tips:
+- Use GPU if available: `--device cuda`
+- Lower confidence for more detections: `--conf 0.3`
+- Adjust distance thresholds for your environment
+
+## 📁 File Structure
+
+```
+following robot/
+├── main.py                    # Main application
+├── arduino_motor_control.ino  # Arduino motor control code
+├── requirements.txt           # Python dependencies
+├── test_elevator_music.py     # Elevator music test
+├── Elevator Music - aeiouFU.mp3  # Elevator music file
+├── README.md                  # This file
+├── yolov8n.pt                # YOLO model (auto-downloaded)
+└── human detection dataset/   # Training dataset (if available)
+```
 
 ## 🤝 Contributing
 
-Feel free to contribute to this project by:
-- Reporting bugs
-- Suggesting new features
-- Improving documentation
-- Optimizing performance
+Feel free to submit issues and enhancement requests!
 
 ## 📄 License
 
-This project is open source. Feel free to use and modify for your own projects.
+This project is open source and available under the MIT License.
 
 ## 🙏 Acknowledgments
 
-- **Ultralytics** for the YOLO models and framework
-- **OpenCV** for computer vision capabilities
-- **PyTorch** for deep learning inference
-
----
-
-**Note**: This system is designed for educational and research purposes. Always ensure safety when using with physical robots.
-#   W e i g h t _ l i f t i n g _ R o b o t 
- 
- #   W e i g h t _ l i f t i n g _ R o b o t 
- 
- #   W e i g h t _ l i f t i n g _ R o b o t 
- 
- #   W e i g h t _ l i f t i n g _ R o b o t  
- 
+- YOLO by Ultralytics
+- OpenCV community
+- Arduino community 

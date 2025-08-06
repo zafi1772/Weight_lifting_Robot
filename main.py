@@ -1,1150 +1,428 @@
-#!/usr/bin/env python3
 """
-Live Human Detection with GUI using YOLO 10 - Raspberry Pi 4 Optimized
-Real-time human detection with position tracking and movement detection
-Integrated with Arduino motor control for Raspberry Pi 4 (4GB RAM)
+Real-time human detection from a live camera feed using a pretrained YOLO model (supports YOLOv8 or the newer YOLOv10).
+
+How it works
+------------
+1. Loads a pretrained YOLO model (default: yolov10n). You can pass the path
+   to a custom model checkpoint if you have fine-tuned weights.
+2. Captures frames from a webcam (default index 0).
+3. Runs object detection on each frame, filtering for the "person" class.
+4. Draws bounding-boxes and confidence scores around detected people.
+5. Sends motor control commands via serial to Arduino with L298N.
+6. Press the **q** key to quit.
+
+Prerequisites
+-------------
+Install dependencies with:
+    pip install -r requirements.txt
+
+Example
+-------
+    python human_detection_live.py --source 0 --model yolov10n.pt --conf 0.4
+
+Options
+-------
+--source   Webcam index or video file/stream URL.
+--model    Path to a YOLO checkpoint (default: yolov10n.pt).
+--conf     Confidence threshold for displaying detections.
+--close_cm      Distance < this value → "Close" (default 340)
+--far_cm        Distance > this value → "Far"   (default 455)
+--center_margin Fraction of frame width that's treated as center band (default 0.15)
+--idle_thresh   Pixel displacement below which a person is considered idle (default 20)
+--device        Device to use: "cpu", "cuda", or a CUDA device index (e.g. 0).
+--serial_port   Serial port for Arduino communication (default: COM3)
+--baud_rate     Baud rate for serial communication (default: 9600)
 """
+import argparse
+from pathlib import Path
+import serial
+import time
+import pygame
+import threading
 
 import cv2
-import numpy as np
-import time
-from ultralytics import YOLO
-from collections import deque
 import math
-import serial
-import threading
-from typing import Optional, Dict, Any
-import os
-import platform
+import numpy as np
+from ultralytics import YOLO
 
-# Raspberry Pi specific imports
-try:
-    import picamera
-    from picamera.array import PiRGBArray
-    PI_CAMERA_AVAILABLE = True
-except ImportError:
-    PI_CAMERA_AVAILABLE = False
-    print("PiCamera not available, using USB camera")
 
-class ArduinoMotorInterface:
-    def __init__(self, port: str = '/dev/ttyUSB0', baud_rate: int = 115200, timeout: int = 1):
-        """
-        Initialize Arduino motor interface for Raspberry Pi
-        
-        Args:
-            port: Serial port (e.g., '/dev/ttyUSB0' or '/dev/ttyACM0' on Raspberry Pi)
-            baud_rate: Serial communication baud rate
-            timeout: Serial timeout in seconds
-        """
-        self.port = port
-        self.baud_rate = baud_rate
-        self.timeout = timeout
-        self.arduino: Optional[serial.Serial] = None
-        self.is_connected = False
-        self.last_command = None
-        self.command_lock = threading.Lock()
-        
-        # Motor command mappings
-        self.commands = {
-            'forward': 'F',
-            'backward': 'B', 
-            'left': 'L',
-            'right': 'R',
-            'forward_left': 'FL',
-            'forward_right': 'FR',
-            'stop': 'S'
-        }
-        
-        # Command aliases for different naming conventions
-        self.command_aliases = {
-            'fwd': 'forward',
-            'fwd_left': 'forward_left',
-            'fwd_right': 'forward_right',
-            'back': 'backward',
-            'turn_left': 'left',
-            'turn_right': 'right'
-        }
-    
-    def connect(self) -> bool:
-        """
-        Connect to Arduino via serial with Raspberry Pi port detection
-        """
-        # Try common Raspberry Pi serial ports
-        possible_ports = [
-            '/dev/ttyUSB0',
-            '/dev/ttyUSB1', 
-            '/dev/ttyACM0',
-            '/dev/ttyACM1',
-            '/dev/ttyS0',
-            '/dev/ttyS1'
-        ]
-        
-        # If specific port provided, try it first
-        if self.port not in possible_ports:
-            possible_ports.insert(0, self.port)
-        
-        for port in possible_ports:
-            try:
-                if os.path.exists(port):
-                    self.arduino = serial.Serial(
-                        port=port,
-                        baudrate=self.baud_rate,
-                        timeout=self.timeout
-                    )
-                    
-                    # Wait for Arduino to reset
-                    time.sleep(2)
-                    
-                    # Clear any pending data
-                    if self.arduino.in_waiting:
-                        self.arduino.read(self.arduino.in_waiting)
-                    
-                    self.is_connected = True
-                    self.port = port  # Update to actual port used
-                    print(f"Connected to Arduino on {port}")
-                    return True
-                    
-            except serial.SerialException as e:
-                print(f"Failed to connect on {port}: {e}")
-                continue
-        
-        print("Failed to connect to Arduino on any available port")
-        self.is_connected = False
-        return False
-    
-    def disconnect(self):
-        """Disconnect from Arduino"""
-        if self.arduino and self.arduino.is_open:
-            self.arduino.close()
-        self.is_connected = False
-        print("Disconnected from Arduino")
-    
-    def send_command(self, command: str) -> bool:
-        """
-        Send motor command to Arduino
-        
-        Args:
-            command: Motor command (e.g., 'forward', 'left', 'stop')
-            
-        Returns:
-            bool: True if command sent successfully, False otherwise
-        """
-        if not self.is_connected or not self.arduino:
-            print("Arduino not connected")
-            return False
-        
-        with self.command_lock:
-            try:
-                # Normalize command
-                command = command.lower().strip()
-                
-                # Check aliases
-                if command in self.command_aliases:
-                    command = self.command_aliases[command]
-                
-                # Get Arduino command
-                if command in self.commands:
-                    arduino_command = self.commands[command]
-                else:
-                    print(f"Unknown command: {command}")
-                    return False
-                
-                # Send command
-                self.arduino.write((arduino_command + '\n').encode())
-                self.last_command = command
-                
-                # Small delay for command processing
-                time.sleep(0.1)
-                
-                print(f"Sent command: {command} -> {arduino_command}")
-                return True
-                
-            except serial.SerialException as e:
-                print(f"Error sending command: {e}")
-                self.is_connected = False
-                return False
-    
-    def send_pwm_command(self, pwm_command: str) -> bool:
-        """
-        Send PWM command to Arduino
-        
-        Args:
-            pwm_command: PWM command string (e.g., 'PWM:200,200,F')
-            
-        Returns:
-            bool: True if command sent successfully, False otherwise
-        """
-        if not self.is_connected or not self.arduino:
-            print("Arduino not connected")
-            return False
-        
-        with self.command_lock:
-            try:
-                # Send PWM command directly
-                self.arduino.write((pwm_command + '\n').encode())
-                self.last_command = pwm_command
-                
-                # Small delay for command processing
-                time.sleep(0.1)
-                
-                print(f"Sent PWM command: {pwm_command}")
-                return True
-                
-            except serial.SerialException as e:
-                print(f"Error sending PWM command: {e}")
-                self.is_connected = False
-                return False
-    
-    def get_pwm_command_from_detection(self, detection: Dict[str, Any]) -> Optional[str]:
-        """
-        Convert detection data to PWM motor command with speed control
-        
-        Args:
-            detection: Detection data from the tracker
-            
-        Returns:
-            str: PWM command string or None if no action needed
-        """
-        if not detection:
-            return None
-        
-        # Extract position information
-        horizontal_pos = detection.get('position', 'center')
-        distance = detection.get('distance', 'GOOD DISTANCE')
-        movement = detection.get('movement', 'IDLE')
-        
-        # PWM speed settings based on distance
-        PWM_FAR = 200      # When person is far
-        PWM_IDLE = 150     # When person is at good distance (idle)
-        PWM_CLOSE = 0      # When person is too close (stop)
-        
-        # Determine PWM speed and direction based on distance
-        if distance == "TOO CLOSE":
-            # Too close - stop (PWM 0)
-            return f"PWM:{PWM_CLOSE},{PWM_CLOSE},S"
-        elif distance == "TOO FAR":
-            # Too far - move forward with high speed
-            if horizontal_pos == 'LEFT':
-                return f"PWM:{PWM_FAR//2},{PWM_FAR},F"  # Turn right while moving forward
-            elif horizontal_pos == 'RIGHT':
-                return f"PWM:{PWM_FAR},{PWM_FAR//2},F"  # Turn left while moving forward
-            else:
-                return f"PWM:{PWM_FAR},{PWM_FAR},F"     # Straight forward
-        elif distance == "GOOD DISTANCE":
-            # Good distance - adjust based on horizontal position
-            if horizontal_pos == 'LEFT':
-                return f"PWM:{PWM_IDLE//2},{PWM_IDLE},F"  # Turn right slowly
-            elif horizontal_pos == 'RIGHT':
-                return f"PWM:{PWM_IDLE},{PWM_IDLE//2},F"  # Turn left slowly
-            else:
-                # Center position - idle speed
-                if movement != 'IDLE':
-                    return f"PWM:{PWM_IDLE},{PWM_IDLE},F"  # Follow at idle speed
-                else:
-                    return f"PWM:{PWM_CLOSE},{PWM_CLOSE},S"  # Stop if no movement
-        else:
-            # Default - stop
-            return f"PWM:{PWM_CLOSE},{PWM_CLOSE},S"
-    
-    def emergency_stop(self):
-        """Emergency stop - immediately stop all motors"""
-        self.send_pwm_command("PWM:0,0,S")
-        print("EMERGENCY STOP executed")
-    
-    def __enter__(self):
-        """Context manager entry"""
-        self.connect()
-        return self
-    
-    def __exit__(self, exc_type, exc_val, exc_tb):
-        """Context manager exit"""
-        self.disconnect()
+def parse_args() -> argparse.Namespace:
+    """Parse command-line arguments."""
+    parser = argparse.ArgumentParser(description="Real-time human detection with YOLO")
+    parser.add_argument("--source", type=str, default="0", help="Webcam index or video file/stream URL")
+    parser.add_argument("--model", type=str, default="yolov10n.pt", help="YOLO model checkpoint (v8/v10)")
+    parser.add_argument("--conf", type=float, default=0.4, help="Confidence threshold")
+    parser.add_argument("--close_cm", type=float, default=340.0, help="Distance below this (cm) considered 'Close'")
+    parser.add_argument("--far_cm", type=float, default=455.0, help="Distance above this (cm) considered 'Far'")
+    parser.add_argument("--idle_thresh", type=float, default=20.0, help="Pixel movement below this is considered idle")
+    parser.add_argument("--avg_height_cm", type=float, default=170.0, help="Assumed real human height in cm")
+    parser.add_argument("--focal_px", type=float, default=900.0, help="Camera focal length in pixels (calibrate for accuracy)")
+    parser.add_argument("--center_margin", type=float, default=0.15, help="Fraction of frame width considered center band")
+    parser.add_argument("--serial_port", type=str, default="COM3", help="Serial port for Arduino (e.g., COM3, /dev/ttyUSB0)")
+    parser.add_argument("--baud_rate", type=int, default=9600, help="Baud rate for serial communication")
+    parser.add_argument(
+        "--device",
+        type=str,
+        default="cuda" if cv2.cuda.getCudaEnabledDeviceCount() > 0 else "cpu",
+        help='Device to run the model on ("cpu", "cuda", or CUDA device index)',
+    )
+    return parser.parse_args()
 
-class PiCameraInterface:
-    """Raspberry Pi Camera interface with optimized settings for Pi 4"""
-    
-    def __init__(self, resolution=(640, 480), framerate=30):
-        self.camera = None
-        self.raw_capture = None
-        self.resolution = resolution
-        self.framerate = framerate
-        self.is_pi_camera = False
-        
-    def initialize(self):
-        """Initialize camera (PiCamera or USB camera)"""
-        if PI_CAMERA_AVAILABLE:
-            try:
-                self.camera = picamera.PiCamera()
-                self.camera.resolution = self.resolution
-                self.camera.framerate = self.framerate
-                self.camera.rotation = 0
-                
-                # Optimize for Pi 4 performance
-                self.camera.exposure_mode = 'auto'
-                self.camera.awb_mode = 'auto'
-                self.camera.meter_mode = 'average'
-                
-                # Reduce memory usage
-                self.camera.video_stabilization = False
-                self.camera.image_effect = 'none'
-                
-                self.raw_capture = PiRGBArray(self.camera, size=self.resolution)
-                self.is_pi_camera = True
-                print(f"PiCamera initialized: {self.resolution[0]}x{self.resolution[1]} @ {self.framerate}fps")
-                return True
-                
-            except Exception as e:
-                print(f"PiCamera initialization failed: {e}")
-                self.is_pi_camera = False
-        
-        # Fallback to USB camera
-        try:
-            self.camera = cv2.VideoCapture(0)
-            if not self.camera.isOpened():
-                # Try different camera indices
-                for i in range(4):
-                    self.camera = cv2.VideoCapture(i)
-                    if self.camera.isOpened():
-                        break
-            
-            if self.camera.isOpened():
-                # Set camera properties for Pi optimization
-                self.camera.set(cv2.CAP_PROP_FRAME_WIDTH, self.resolution[0])
-                self.camera.set(cv2.CAP_PROP_FRAME_HEIGHT, self.resolution[1])
-                self.camera.set(cv2.CAP_PROP_FPS, self.framerate)
-                self.camera.set(cv2.CAP_PROP_BUFFERSIZE, 1)  # Reduce buffer size
-                
-                # Get actual resolution
-                actual_width = int(self.camera.get(cv2.CAP_PROP_FRAME_WIDTH))
-                actual_height = int(self.camera.get(cv2.CAP_PROP_FRAME_HEIGHT))
-                print(f"USB Camera initialized: {actual_width}x{actual_height}")
-                return True
-            else:
-                print("Failed to initialize USB camera")
-                return False
-                
-        except Exception as e:
-            print(f"Camera initialization error: {e}")
-            return False
-    
-    def read(self):
-        """Read frame from camera"""
-        if self.is_pi_camera and self.camera:
-            try:
-                frame = self.camera.capture_continuous(self.raw_capture, format="bgr", use_video_port=True)
-                image = next(frame)
-                self.raw_capture.truncate(0)
-                return True, image.array
-            except Exception as e:
-                print(f"PiCamera read error: {e}")
-                return False, None
-        elif self.camera:
-            return self.camera.read()
-        else:
-            return False, None
-    
-    def release(self):
-        """Release camera resources"""
-        if self.is_pi_camera and self.camera:
-            self.camera.close()
-        elif self.camera:
-            self.camera.release()
-        self.camera = None
-        self.raw_capture = None
 
-class PositionTracker:
-    def __init__(self, history_length=10):
-        self.history = deque(maxlen=history_length)
-        self.center_x = None
-        self.center_y = None
-        self.frame_width = None
-        self.frame_height = None
-        self.distance_history = deque(maxlen=history_length)
-        self.movement_history = deque(maxlen=history_length)
-        self.last_update_time = time.time()
-        
-        # Calibration parameters for distance estimation
-        self.known_person_height_pixels = 200  # Reference height in pixels at known distance
-        self.known_distance_cm = 100  # Known distance in cm
-        self.actual_person_height_cm = 170  # Average person height in cm
-        
-    def update_frame_size(self, width, height):
-        self.frame_width = width
-        self.frame_height = height
-        self.center_x = width // 2
-        self.center_y = height // 2
-    
-    def calculate_distance_to_center(self, center_x, center_y):
-        """Calculate pixel distance from detection center to frame center"""
-        dx = center_x - self.center_x
-        dy = center_y - self.center_y
-        return math.sqrt(dx*dx + dy*dy)
-    
-    def estimate_real_distance(self, bbox):
-        """Estimate real-world distance using bounding box size"""
-        x1, y1, x2, y2 = bbox
-        person_height_pixels = y2 - y1
-        
-        if person_height_pixels <= 0:
-            return None
-            
-        # Use inverse relationship: distance = known_distance * (known_height / current_height)
-        estimated_distance_cm = self.known_distance_cm * (self.known_person_height_pixels / person_height_pixels)
-        return estimated_distance_cm
-    
-    def calculate_movement_distance(self, pos1, pos2):
-        """Calculate movement distance between two positions"""
-        dx = pos2['center_x'] - pos1['center_x']
-        dy = pos2['center_y'] - pos1['center_y']
-        return math.sqrt(dx*dx + dy*dy)
-    
-    def calculate_movement_speed(self, movement_distance, time_delta):
-        """Calculate movement speed in pixels per second"""
-        if time_delta > 0:
-            return movement_distance / time_delta
-        return 0
-    
-    def add_detection(self, bbox):
-        """Add detection to history and return position info with distance measurements"""
-        x1, y1, x2, y2 = bbox
-        center_x = (x1 + x2) // 2
-        center_y = (y1 + y2) // 2
-        bbox_area = (x2 - x1) * (y2 - y1)
-        
-        # Calculate distances
-        pixel_distance_to_center = self.calculate_distance_to_center(center_x, center_y)
-        estimated_real_distance = self.estimate_real_distance(bbox)
-        
-        current_time = time.time()
-        time_delta = current_time - self.last_update_time
-        
-        detection_data = {
-            'center_x': center_x,
-            'center_y': center_y,
-            'area': bbox_area,
-            'bbox': bbox,
-            'pixel_distance_to_center': pixel_distance_to_center,
-            'estimated_real_distance_cm': estimated_real_distance,
-            'timestamp': current_time,
-            'time_delta': time_delta
-        }
-        
-        self.history.append(detection_data)
-        self.distance_history.append(pixel_distance_to_center)
-        
-        # Calculate movement metrics
-        movement_metrics = self.calculate_movement_metrics()
-        detection_data.update(movement_metrics)
-        
-        self.last_update_time = current_time
-        
-        return self.analyze_position(center_x, center_y, bbox_area, detection_data)
-    
-    def calculate_movement_metrics(self):
-        """Calculate comprehensive movement metrics"""
-        if len(self.history) < 2:
-            return {
-                'movement_distance_pixels': 0,
-                'movement_speed_pixels_per_sec': 0,
-                'total_distance_traveled': 0,
-                'average_speed': 0,
-                'movement_direction_degrees': 0
-            }
-        
-        # Get current and previous positions
-        current = self.history[-1]
-        previous = self.history[-2]
-        
-        # Calculate movement distance
-        movement_distance = self.calculate_movement_distance(previous, current)
-        
-        # Calculate movement speed
-        movement_speed = self.calculate_movement_speed(movement_distance, current['time_delta'])
-        
-        # Calculate total distance traveled
-        total_distance = sum([
-            self.calculate_movement_distance(self.history[i], self.history[i+1])
-            for i in range(len(self.history)-1)
-        ])
-        
-        # Calculate average speed
-        total_time = sum([h['time_delta'] for h in list(self.history)[1:]])
-        average_speed = total_distance / total_time if total_time > 0 else 0
-        
-        # Calculate movement direction in degrees
-        dx = current['center_x'] - previous['center_x']
-        dy = current['center_y'] - previous['center_y']
-        direction_degrees = math.degrees(math.atan2(dy, dx))
-        if direction_degrees < 0:
-            direction_degrees += 360
-        
-        return {
-            'movement_distance_pixels': movement_distance,
-            'movement_speed_pixels_per_sec': movement_speed,
-            'total_distance_traveled': total_distance,
-            'average_speed': average_speed,
-            'movement_direction_degrees': direction_degrees
-        }
-    
-    def analyze_position(self, center_x, center_y, area, detection_data):
-        """Analyze current position and movement with numerical data using real-world distance thresholds"""
-        if self.frame_width is None:
-            return "Unknown", "Unknown", "Unknown", detection_data
-        
-        # Position analysis
-        x_zone = self.frame_width // 3
-        if center_x < x_zone:
-            horizontal_pos = "LEFT"
-        elif center_x > 2 * x_zone:
-            horizontal_pos = "RIGHT"
-        else:
-            horizontal_pos = "CENTER"
-        
-        # Distance analysis based on real-world distance in centimeters
-        real_distance = detection_data['estimated_real_distance_cm']
-        
-        # Real-world distance thresholds:
-        # Less than 29 cm = TOO CLOSE
-        # 29-31 cm = GOOD DISTANCE (IDLE zone)
-        # More than 31 cm = TOO FAR
-        if real_distance is None:
-            # Fallback to pixel distance if real distance estimation fails
-            pixel_distance = detection_data['pixel_distance_to_center']
-            if pixel_distance < 27:
-                distance = "TOO CLOSE"
-            elif pixel_distance <= 50:
-                distance = "GOOD DISTANCE"
-            else:
-                distance = "TOO FAR"
-        else:
-            if real_distance < 29:
-                distance = "TOO CLOSE"
-            elif real_distance <= 31:
-                distance = "GOOD DISTANCE"
-            else:
-                distance = "TOO FAR"
-        
-        # Movement analysis with numerical data
-        movement = self.analyze_movement_with_numbers(detection_data)
-        
-        return horizontal_pos, distance, movement, detection_data
-    
-    def analyze_movement_with_numbers(self, detection_data):
-        """Analyze movement direction based on history with numerical data"""
-        if len(self.history) < 3:
-            return "IDLE"
-        
-        # Get recent positions
-        recent = list(self.history)[-3:]
-        
-        # Calculate movement direction
-        x_movement = recent[-1]['center_x'] - recent[0]['center_x']
-        y_movement = recent[-1]['center_y'] - recent[0]['center_y']
-        
-        # Threshold for movement detection
-        threshold = 20
-        
-        if abs(x_movement) < threshold and abs(y_movement) < threshold:
-            return "IDLE"
-        elif abs(x_movement) > abs(y_movement):
-            if x_movement > threshold:
-                return "GOING RIGHT"
-            else:
-                return "GOING LEFT"
-        else:
-            if y_movement > threshold:
-                return "GOING DOWN"
-            else:
-                return "GOING UP"
-
-def detect_humans_yolo(frame, model, tracker):
-    """Detect humans using YOLO 10 with position tracking and distance measurement"""
-    detections = []
-    
-    # Update tracker with frame size
-    tracker.update_frame_size(frame.shape[1], frame.shape[0])
-    
-    # Run YOLO detection
-    results = model(frame, conf=0.3, verbose=False)
-    
-    # Process detections
-    for result in results:
-        if result.boxes is not None:
-            for box in result.boxes:
-                # Get box coordinates
-                x1, y1, x2, y2 = box.xyxy[0].cpu().numpy()
-                x1, y1, x2, y2 = int(x1), int(y1), int(x2), int(y2)
-                
-                # Get class and confidence
-                class_id = int(box.cls[0])
-                confidence = float(box.conf[0])
-                
-                # Get class name
-                class_name = model.names[class_id]
-                
-                # Only process human-related detections
-                if 'person' in class_name.lower():
-                    # Analyze position and movement with distance measurements
-                    horizontal_pos, distance, movement, detection_data = tracker.add_detection((x1, y1, x2, y2))
-                    
-                    detections.append({
-                        'class': class_name,
-                        'confidence': confidence,
-                        'bbox': (x1, y1, x2, y2),
-                        'position': horizontal_pos,
-                        'distance': distance,
-                        'movement': movement,
-                        'pixel_distance_to_center': detection_data['pixel_distance_to_center'],
-                        'estimated_real_distance_cm': detection_data['estimated_real_distance_cm'],
-                        'movement_distance_pixels': detection_data['movement_distance_pixels'],
-                        'movement_speed_pixels_per_sec': detection_data['movement_speed_pixels_per_sec'],
-                        'total_distance_traveled': detection_data['total_distance_traveled'],
-                        'average_speed': detection_data['average_speed'],
-                        'movement_direction_degrees': detection_data['movement_direction_degrees']
-                    })
-                    
-                    # Draw bounding box with color based on position
-                    color = get_position_color(horizontal_pos, distance)
-                    cv2.rectangle(frame, (x1, y1), (x2, y2), color, 2)
-                    
-                    # Add detailed label with distance information
-                    real_distance = detection_data['estimated_real_distance_cm']
-                    pixel_distance = detection_data['pixel_distance_to_center']
-                    speed = detection_data['movement_speed_pixels_per_sec']
-                    
-                    if real_distance is not None:
-                        label = f"Person: {confidence:.2f} | {horizontal_pos} | {distance} | {movement}"
-                        label2 = f"Distance: {real_distance:.1f}cm | Pixel: {pixel_distance:.0f} | Speed: {speed:.1f}px/s"
-                    else:
-                        label = f"Person: {confidence:.2f} | {horizontal_pos} | {distance} | {movement}"
-                        label2 = f"Pixel Distance: {pixel_distance:.0f} | Speed: {speed:.1f}px/s"
-                    
-                    cv2.putText(frame, label, (x1, y1-10), 
-                               cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 2)
-                    cv2.putText(frame, label2, (x1, y1+10), 
-                               cv2.FONT_HERSHEY_SIMPLEX, 0.4, color, 2)
-    
-    return detections
-
-def get_position_color(horizontal_pos, distance):
-    """Get color based on position and distance"""
-    if distance == "TOO FAR":
-        return (0, 0, 255)  # Red
-    elif distance == "TOO CLOSE":
-        return (0, 165, 255)  # Orange
-    elif horizontal_pos == "LEFT":
-        return (255, 0, 0)  # Blue
-    elif horizontal_pos == "RIGHT":
-        return (255, 0, 255)  # Magenta
-    else:  # CENTER and GOOD DISTANCE
-        return (0, 255, 0)  # Green
-
-def get_robot_command(detection):
-    """Generate robot command based on detection"""
-    position = detection['position']
-    distance = detection['distance']
-    movement = detection['movement']
-    
-    # Safety first - stop if too close
-    if distance == "TOO CLOSE":
-        return "STOP - TOO CLOSE"
-    
-    # If person is too far, move forward
-    if distance == "TOO FAR":
-        return "MOVE FORWARD"
-    
-    # If person is at good distance, follow based on position
-    if distance == "GOOD DISTANCE":
-        if position == "LEFT":
-            return "TURN LEFT"
-        elif position == "RIGHT":
-            return "TURN RIGHT"
-        elif position == "CENTER":
-            if movement == "GOING LEFT":
-                return "TURN LEFT SLOWLY"
-            elif movement == "GOING RIGHT":
-                return "TURN RIGHT SLOWLY"
-            else:  # IDLE
-                return "FOLLOW - CENTER"
-    
-    # Default command
-    return "FOLLOW"
-
-def get_command_color(command):
-    """Get color for robot command"""
-    if "STOP" in command:
-        return (0, 0, 255)  # Red for stop
-    elif "MOVE FORWARD" in command:
-        return (0, 255, 255)  # Cyan for forward
-    elif "TURN LEFT" in command:
-        return (255, 0, 0)  # Blue for left
-    elif "TURN RIGHT" in command:
-        return (255, 0, 255)  # Magenta for right
-    elif "FOLLOW" in command:
-        return (0, 255, 0)  # Green for follow
+def open_capture(source: str) -> cv2.VideoCapture:
+    """Create a cv2.VideoCapture from an integer index or string path/URL."""
+    if source.isdigit():
+        cap = cv2.VideoCapture(int(source))
     else:
-        return (255, 255, 255)  # White for default
+        cap = cv2.VideoCapture(source)
+    if not cap.isOpened():
+        raise RuntimeError(f"Unable to open video source {source}")
+    return cap
 
-def draw_status_panel(frame, detections, frame_count, total_detections, fps, motor_interface=None, arduino_connected=False):
-    """Draw status panel with position information, distance measurements, robot commands, and motor control"""
-    # Create semi-transparent overlay
-    overlay = frame.copy()
-    cv2.rectangle(overlay, (10, 10), (500, 400), (0, 0, 0), -1)  # Increased height for motor info
-    cv2.addWeighted(overlay, 0.7, frame, 0.3, 0, frame)
-    
-    # Draw status information
-    y_offset = 35
-    line_height = 25
-    
-    # Basic stats
-    cv2.putText(frame, f"Detections: {len(detections)}", (20, y_offset), 
-               cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
-    y_offset += line_height
-    
-    cv2.putText(frame, f"Frame: {frame_count}", (20, y_offset), 
-               cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
-    y_offset += line_height
-    
-    cv2.putText(frame, f"Total: {total_detections}", (20, y_offset), 
-               cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
-    y_offset += line_height
-    
-    cv2.putText(frame, f"FPS: {fps:.1f}", (20, y_offset), 
-               cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
-    y_offset += line_height
-    
-    # Position information
-    if detections:
-        detection = detections[0]  # Show info for first detection
-        cv2.putText(frame, f"Position: {detection['position']}", (20, y_offset), 
-                   cv2.FONT_HERSHEY_SIMPLEX, 0.6, get_position_color(detection['position'], detection['distance']), 2)
-        y_offset += line_height
-        
-        cv2.putText(frame, f"Distance: {detection['distance']}", (20, y_offset), 
-                   cv2.FONT_HERSHEY_SIMPLEX, 0.6, get_position_color(detection['position'], detection['distance']), 2)
-        y_offset += line_height
-        
-        cv2.putText(frame, f"Movement: {detection['movement']}", (20, y_offset), 
-                   cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
-        y_offset += line_height
-        
-        # Distance measurements
-        real_distance = detection['estimated_real_distance_cm']
-        pixel_distance = detection['pixel_distance_to_center']
-        
-        if real_distance is not None:
-            cv2.putText(frame, f"Real Distance: {real_distance:.1f} cm", (20, y_offset), 
-                       cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 255), 2)
-        else:
-            cv2.putText(frame, f"Real Distance: N/A", (20, y_offset), 
-                       cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 255), 2)
-        y_offset += line_height
-        
-        cv2.putText(frame, f"Pixel Distance: {pixel_distance:.0f} px", (20, y_offset), 
-                   cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 255), 2)
-        y_offset += line_height
-        
-        # Movement metrics
-        movement_distance = detection['movement_distance_pixels']
-        movement_speed = detection['movement_speed_pixels_per_sec']
-        total_traveled = detection['total_distance_traveled']
-        avg_speed = detection['average_speed']
-        direction_deg = detection['movement_direction_degrees']
-        
-        cv2.putText(frame, f"Movement: {movement_distance:.1f} px", (20, y_offset), 
-                   cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 0), 2)
-        y_offset += line_height
-        
-        cv2.putText(frame, f"Speed: {movement_speed:.1f} px/s", (20, y_offset), 
-                   cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 0), 2)
-        y_offset += line_height
-        
-        cv2.putText(frame, f"Total Traveled: {total_traveled:.1f} px", (20, y_offset), 
-                   cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 0), 2)
-        y_offset += line_height
-        
-        cv2.putText(frame, f"Avg Speed: {avg_speed:.1f} px/s", (20, y_offset), 
-                   cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 0), 2)
-        y_offset += line_height
-        
-        cv2.putText(frame, f"Direction: {direction_deg:.0f}°", (20, y_offset), 
-                   cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 0), 2)
-        y_offset += line_height
-        
-        # Robot command
-        robot_command = get_robot_command(detection)
-        command_color = get_command_color(robot_command)
-        cv2.putText(frame, f"Robot: {robot_command}", (20, y_offset), 
-                   cv2.FONT_HERSHEY_SIMPLEX, 0.7, command_color, 2)
-        y_offset += line_height
-        
-        # Safety status
-        if detection['distance'] == "TOO CLOSE":
-            cv2.putText(frame, "⚠️ SAFETY STOP ACTIVATED", (20, y_offset), 
-                       cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 255), 2)
-            y_offset += line_height
-        
-        # Motor control information
-        if arduino_connected and motor_interface:
-            pwm_command = motor_interface.get_pwm_command_from_detection(detection)
-            if pwm_command:
-                # Parse PWM command for display
-                if pwm_command.startswith("PWM:"):
-                    parts = pwm_command.split(',')
-                    if len(parts) >= 3:
-                        left_speed = parts[0].split(':')[1]
-                        right_speed = parts[1]
-                        direction = parts[2]
-                        
-                        cv2.putText(frame, f"Motor Control:", (20, y_offset), 
-                                   cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 255), 2)
-                        y_offset += line_height
-                        
-                        cv2.putText(frame, f"L: {left_speed} | R: {right_speed} | Dir: {direction}", (20, y_offset), 
-                                   cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 255), 2)
-                        y_offset += line_height
-                        
-                        # Show speed interpretation
-                        if left_speed == "0" and right_speed == "0":
-                            cv2.putText(frame, "Status: STOPPED", (20, y_offset), 
-                                       cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 255), 2)
-                        elif left_speed == "200" or right_speed == "200":
-                            cv2.putText(frame, "Status: HIGH SPEED", (20, y_offset), 
-                                       cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 2)
-                        else:
-                            cv2.putText(frame, "Status: IDLE SPEED", (20, y_offset), 
-                                       cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 0), 2)
-    else:
-        cv2.putText(frame, "No person detected", (20, y_offset), 
-                   cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 255), 2)
-        y_offset += line_height
-        
-        # Motor status when no detection
-        if arduino_connected:
-            cv2.putText(frame, "Motor: STOPPED (no detection)", (20, y_offset), 
-                       cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 255), 2)
-        y_offset += line_height
-        cv2.putText(frame, "Robot: SEARCHING", (20, y_offset), 
-                   cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 0), 2)
 
-def draw_guidance_zones(frame):
-    """Draw guidance zones and safety zones on the frame with real-world distance thresholds"""
-    height, width = frame.shape[:2]
-    
-    # Draw center zone
-    center_x = width // 2
-    center_y = height // 2
-    
-    # Distance zones based on real-world distance thresholds:
-    # Red circle: < 29 cm (TOO CLOSE)
-    # Green circle: 29-31 cm (GOOD DISTANCE/IDLE)
-    # Blue circle: > 31 cm (TOO FAR)
-    
-    # Note: We'll use approximate pixel circles for visualization
-    # These will be updated based on the actual distance estimation
-    
-    # Too Far zone (blue circle - outside 31 cm equivalent)
-    cv2.circle(frame, (center_x, center_y), 50, (255, 0, 0), 2)
-    cv2.putText(frame, "TOO FAR (>31cm)", (center_x - 50, center_y - 60), 
-               cv2.FONT_HERSHEY_SIMPLEX, 0.4, (255, 0, 0), 2)
-    
-    # Good Distance zone (green circle - 29-31 cm equivalent)
-    cv2.circle(frame, (center_x, center_y), 30, (0, 255, 0), 2)
-    cv2.putText(frame, "GOOD DISTANCE (29-31cm)", (center_x - 70, center_y - 30), 
-               cv2.FONT_HERSHEY_SIMPLEX, 0.4, (0, 255, 0), 2)
-    
-    # Too Close zone (red circle - inside 29 cm equivalent)
-    cv2.circle(frame, (center_x, center_y), 20, (0, 0, 255), 2)
-    cv2.putText(frame, "TOO CLOSE (<29cm)", (center_x - 50, center_y + 30), 
-               cv2.FONT_HERSHEY_SIMPLEX, 0.4, (0, 0, 255), 2)
-    
-    # Left zone (blue)
-    left_x = width // 4
-    cv2.circle(frame, (left_x, center_y), 40, (255, 0, 0), 2)
-    cv2.putText(frame, "LEFT", (left_x - 20, center_y - 50), 
-               cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 0, 0), 2)
-    
-    # Right zone (magenta)
-    right_x = 3 * width // 4
-    cv2.circle(frame, (right_x, center_y), 40, (255, 0, 255), 2)
-    cv2.putText(frame, "RIGHT", (right_x - 25, center_y - 50), 
-               cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 0, 255), 2)
-    
-    # Distance indicators with real-world values
-    cv2.putText(frame, "TOO CLOSE (<29cm)", (10, height - 60), 
-               cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 255), 2)
-    cv2.putText(frame, "GOOD DISTANCE (29-31cm)", (10, height - 40), 
-               cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 2)
-    cv2.putText(frame, "TOO FAR (>31cm)", (10, height - 20), 
-               cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 0, 0), 2)
-
-def draw_distance_indicators(frame, tracker):
-    """Draw distance indicators and movement trails"""
-    if len(tracker.history) < 2:
-        return
-    
-    # Draw distance line from center to current position
-    if tracker.history:
-        current_pos = tracker.history[-1]
-        center_x = tracker.center_x
-        center_y = tracker.center_y
-        
-        # Draw line from center to current position
-        cv2.line(frame, (center_x, center_y), 
-                (current_pos['center_x'], current_pos['center_y']), 
-                (0, 255, 255), 2)
-        
-        # Draw distance circle around current position
-        cv2.circle(frame, (current_pos['center_x'], current_pos['center_y']), 
-                  5, (0, 255, 255), -1)
-        
-        # Draw distance text
-        real_distance = current_pos['estimated_real_distance_cm']
-        if real_distance is not None:
-            distance_text = f"{real_distance:.1f}cm"
-        else:
-            distance_text = f"{current_pos['pixel_distance_to_center']:.0f}px"
-        cv2.putText(frame, distance_text, 
-                   (current_pos['center_x'] + 10, current_pos['center_y'] - 10),
-                   cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 255), 2)
-    
-    # Draw movement trail (last 10 positions)
-    if len(tracker.history) >= 2:
-        trail_points = list(tracker.history)[-10:]  # Last 10 positions
-        
-        for i in range(1, len(trail_points)):
-            # Draw line between consecutive points
-            pt1 = (trail_points[i-1]['center_x'], trail_points[i-1]['center_y'])
-            pt2 = (trail_points[i]['center_x'], trail_points[i]['center_y'])
-            
-            # Color based on recency (more recent = brighter)
-            alpha = i / len(trail_points)
-            color = (int(255 * alpha), int(255 * alpha), 0)  # Green to yellow
-            
-            cv2.line(frame, pt1, pt2, color, 2)
-            
-            # Draw small circle at each point
-            cv2.circle(frame, pt2, 3, color, -1)
-
-def main():
-    """Main function for live human detection with GUI and motor control - Raspberry Pi 4 Optimized"""
-    print("Live Human Detection with YOLO 10 - Raspberry Pi 4 Optimized")
-    print("=" * 70)
-    print("Advanced human detection with position and movement tracking")
-    print("Integrated with Arduino motor control using PWM speed control")
-    print("Optimized for Raspberry Pi 4 (4GB RAM)")
-    print("Loading YOLO 10 model...")
-    
-    # Check system information
-    print(f"Platform: {platform.system()} {platform.release()}")
-    print(f"Architecture: {platform.machine()}")
-    print(f"Python: {platform.python_version()}")
-    
-    # Initialize position tracker with reduced history for memory optimization
-    tracker = PositionTracker(history_length=10)
-    
-    # Initialize motor interface for Raspberry Pi
-    motor_interface = ArduinoMotorInterface(port='/dev/ttyUSB0', baud_rate=115200)
-    
-    # Try to connect to Arduino
-    arduino_connected = motor_interface.connect()
-    if arduino_connected:
-        print("✅ Arduino motor control connected!")
-        print("Motor control features:")
-        print("- PWM speed control based on distance")
-        print("- Far distance: PWM 200 (high speed)")
-        print("- Good distance: PWM 150 (idle speed)")
-        print("- Too close: PWM 0 (stop)")
-        print("- Automatic direction control based on position")
-    else:
-        print("⚠️  Arduino not connected - running in detection-only mode")
-        print("Motor commands will be displayed but not sent")
-    
+def open_serial_connection(port: str, baud_rate: int) -> serial.Serial:
+    """Open serial connection to Arduino."""
     try:
-        # Try to load YOLO 10 model
-        model = YOLO('yolov10n.pt')
-        print("✅ YOLO 10 model loaded successfully!")
-    except:
+        ser = serial.Serial(port, baud_rate, timeout=1)
+        time.sleep(2)  # Wait for Arduino to reset
+        print(f"Serial connection established on {port}")
+        return ser
+    except serial.SerialException as e:
+        print(f"Failed to open serial port {port}: {e}")
+        print("Continuing without motor control...")
+        return None
+
+
+def send_motor_command(ser: serial.Serial, command: str):
+    """Send motor command to Arduino."""
+    if ser and ser.is_open:
         try:
-            # Fallback to YOLO 8 if YOLO 10 not available
-            model = YOLO('yolov8n.pt')
-            print("✅ YOLO 8 model loaded successfully!")
-        except Exception as e:
-            print(f"❌ Error loading model: {e}")
-            print("Please ensure you have a YOLO model file")
-            return
-    
-    print("Detection features:")
-    print("- Position tracking (LEFT, CENTER, RIGHT)")
-    print("- Real-world distance monitoring:")
-    print("  * TOO CLOSE: < 29 cm")
-    print("  * GOOD DISTANCE: 29-31 cm")
-    print("  * TOO FAR: > 31 cm")
-    print("- Real-world distance estimation (cm)")
-    print("- Pixel distance measurement")
-    print("- Movement detection (GOING LEFT, GOING RIGHT, IDLE)")
-    print("- Movement speed tracking (pixels/second)")
-    print("- Total distance traveled tracking")
-    print("- Movement direction in degrees")
-    print("- Movement trails visualization")
-    print("- Real-time guidance zones")
-    print("- Optimized for Pi 4 performance")
-    print()
-    print("Controls:")
-    print("- Press 'q' to quit")
-    print("- Press 'f' to toggle fullscreen")
-    print("- Press 'r' to reset window size")
-    print()
-    
-    # Initialize Pi camera interface with optimized settings
-    camera_interface = PiCameraInterface(resolution=(640, 480), framerate=30)
-    
-    if not camera_interface.initialize():
-        print("Error: Could not initialize camera")
-        return
-    
-    print("Starting live human detection with position tracking...")
-    print("Move around to test different positions and movements!")
-    
-    frame_count = 0
-    total_detections = 0
-    start_time = time.time()
-    
-    # Performance optimization: reduce detection frequency for Pi 4
-    detection_interval = 3  # Process every 3rd frame
-    frame_skip_counter = 0
-    
-    while True:
-        ret, frame = camera_interface.read()
+            # Handle combined speed and movement commands
+            if len(command) == 2 and command[0].isdigit():
+                # Send speed first, then movement
+                speed_cmd = command[0]
+                movement_cmd = command[1]
+                ser.write(speed_cmd.encode())
+                time.sleep(0.1)  # Small delay between commands
+                ser.write(movement_cmd.encode())
+                print(f"Sent commands: Speed {speed_cmd}, Movement {movement_cmd}")
+            else:
+                # Single command (like 'S' for stop)
+                ser.write(command.encode())
+                print(f"Sent command: {command}")
+        except serial.SerialException as e:
+            print(f"Serial communication error: {e}")
+
+
+
+
+
+
+def play_elevator_music():
+    """Play mild elevator music using pygame."""
+    try:
+        # Initialize pygame mixer
+        pygame.mixer.init()
         
-        if not ret:
-            print("Failed to grab frame")
-            break
+        # Load and play the elevator music file
+        music_file = "Elevator Music - aeiouFU.mp3"
         
-        # Skip frames for performance optimization on Pi 4
-        frame_skip_counter += 1
-        if frame_skip_counter % detection_interval != 0:
-            # Still display frame but skip detection
-            draw_guidance_zones(frame)
-            draw_status_panel(frame, [], frame_count, total_detections, 0, motor_interface, arduino_connected)
-            
-            # Add instructions
-            instructions = "Press 'q' to quit | 'f' to toggle fullscreen | 'r' to reset size"
-            if arduino_connected:
-                instructions += " | 's' for emergency stop"
-            cv2.putText(frame, instructions, (10, frame.shape[0] - 20), 
-                       cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
-            
-            # Display frame
-            cv2.imshow('Live Human Detection - Pi 4 Optimized', frame)
-            frame_count += 1
-            
-            # Handle key presses
-            key = cv2.waitKey(1) & 0xFF
-            if key == ord('q'):
+        # Load the music file
+        pygame.mixer.music.load(music_file)
+        
+        # Set volume to mild level (0.3 = 30% volume)
+        pygame.mixer.music.set_volume(0.3)
+        
+        # Play the music (loops continuously)
+        pygame.mixer.music.play(-1)  # -1 means loop indefinitely
+        
+    except Exception as e:
+        print(f"Elevator music error: {e}")
+
+
+def stop_elevator_music():
+    """Stop elevator music."""
+    try:
+        pygame.mixer.music.stop()
+    except:
+        pass
+
+
+def determine_motor_command(horiz_state: str, dist_state: str, motion_state: str) -> str:
+    """Determine motor command based on person's position and state."""
+    
+    # Position-based movement with speed control
+    if "Center" in horiz_state:
+        if dist_state == "Far":
+            return "8F"  # Speed 8 + Forward if centered and far
+        elif dist_state == "Close":
+            return "S"  # Stop if centered and close
+        else:
+            return "6F"  # Speed 6 + Forward if centered and idle
+    
+    elif "Slightly Left" in horiz_state:
+        if dist_state == "Far":
+            return "8I"  # Speed 8 + Forward-right to center
+        elif dist_state == "Close":
+            return "S"  # Stop if close
+        else:
+            return "6I"  # Speed 6 + Forward-right to center
+    
+    elif "Slightly Right" in horiz_state:
+        if dist_state == "Far":
+            return "8G"  # Speed 8 + Forward-left to center
+        elif dist_state == "Close":
+            return "S"  # Stop if close
+        else:
+            return "6G"  # Speed 6 + Forward-left to center
+    
+    elif "Left" in horiz_state or "Very Left" in horiz_state:
+        if dist_state == "Far":
+            return "8I"  # Speed 8 + Forward-right
+        elif dist_state == "Close":
+            return "S"  # Stop if close
+        else:
+            return "6I"  # Speed 6 + Forward-right
+    
+    elif "Right" in horiz_state or "Very Right" in horiz_state:
+        if dist_state == "Far":
+            return "8G"  # Speed 8 + Forward-left
+        elif dist_state == "Close":
+            return "S"  # Stop if close
+        else:
+            return "6G"  # Speed 6 + Forward-left
+    
+    elif "Full Left" in horiz_state:
+        if dist_state == "Far":
+            return "8I"  # Speed 8 + Forward-right (sharp)
+        elif dist_state == "Close":
+            return "S"  # Stop if close
+        else:
+            return "6I"  # Speed 6 + Forward-right (sharp)
+    
+    elif "Full Right" in horiz_state:
+        if dist_state == "Far":
+            return "8G"  # Speed 8 + Forward-left (sharp)
+        elif dist_state == "Close":
+            return "S"  # Stop if close
+        else:
+            return "6G"  # Speed 6 + Forward-left (sharp)
+    
+    return "S"  # Default to stop
+
+
+def main() -> None:
+    args = parse_args()
+
+    # Load model (YOLOv8/YOLOv10 or other supported weights)
+    model_path = Path(args.model).expanduser().resolve()
+    model_version = "YOLOv12" if "yolov12" in model_path.name.lower() else "YOLO"
+    print(f"Loading {model_version} model from {model_path} …")
+    model = YOLO(str(model_path))
+
+    # Set device; ultralytics model has .to() but easiest via predict kwargs later
+    device = args.device
+
+    # Open video source
+    cap = open_capture(args.source)
+    
+    # Open serial connection
+    ser = open_serial_connection(args.serial_port, args.baud_rate)
+
+    prev_center = None  # track center of the first detected person to decide idle vs moving
+    last_command = None
+    command_cooldown = 0
+    
+    # Music control variables
+    music_playing = False
+    last_motion_state = None
+    
+
+
+    try:
+        while True:
+            ret, frame = cap.read()
+            if not ret:
+                print("Frame capture failed — exiting")
                 break
-            elif key == ord('f'):
-                current_prop = cv2.getWindowProperty('Live Human Detection - Pi 4 Optimized', cv2.WND_PROP_FULLSCREEN)
-                if current_prop == cv2.WINDOW_FULLSCREEN:
-                    cv2.setWindowProperty('Live Human Detection - Pi 4 Optimized', cv2.WND_PROP_FULLSCREEN, cv2.WINDOW_NORMAL)
+
+            # Inference
+            results = model.predict(frame, conf=args.conf, device=device, verbose=False)
+            r = results[0]
+
+            person_detected = False
+            motor_command = "S"  # Default to stop
+
+            # Draw bounding boxes for class "person" (class id 0 in COCO)
+            for box, cls_id, score in zip(
+                r.boxes.xyxy.cpu().numpy(),
+                r.boxes.cls.cpu().numpy(),
+                r.boxes.conf.cpu().numpy(),
+            ):
+                if int(cls_id) != 0:
+                    continue  # not a person
+
+                person_detected = True
+                x1, y1, x2, y2 = box.astype(int)
+                height_px = y2 - y1
+
+                # Center point of bbox
+                cx, cy = (x1 + x2) // 2, (y1 + y2) // 2
+
+                # Estimate distance in cm: D = (H_real * f) / h_px
+                if height_px > 0:
+                    distance_cm = (args.avg_height_cm * args.focal_px) / height_px
                 else:
-                    cv2.setWindowProperty('Live Human Detection - Pi 4 Optimized', cv2.WND_PROP_FULLSCREEN, cv2.WINDOW_FULLSCREEN)
-            elif key == ord('r'):
-                cv2.setWindowProperty('Live Human Detection - Pi 4 Optimized', cv2.WND_PROP_FULLSCREEN, cv2.WINDOW_NORMAL)
-                cv2.resizeWindow('Live Human Detection - Pi 4 Optimized', 640, 480)
-            elif key == ord('s') and arduino_connected:
-                motor_interface.emergency_stop()
-                print("EMERGENCY STOP triggered by 's' key")
-            continue
-        
-        # Draw guidance zones
-        draw_guidance_zones(frame)
-        
-        # Detect humans using YOLO with position tracking
-        detections = detect_humans_yolo(frame, model, tracker)
-        
-        # Draw distance indicators and movement trails
-        draw_distance_indicators(frame, tracker)
-        
-        # Process motor commands based on detection
-        if detections and arduino_connected:
-            detection = detections[0]  # Use first detection
-            pwm_command = motor_interface.get_pwm_command_from_detection(detection)
-            if pwm_command:
-                motor_interface.send_pwm_command(pwm_command)
-        
-        # Draw status panel
-        elapsed_time = time.time() - start_time
-        fps = frame_count / elapsed_time if elapsed_time > 0 else 0
-        draw_status_panel(frame, detections, frame_count, total_detections, fps, motor_interface, arduino_connected)
-        
-        # Add instructions
-        instructions = "Press 'q' to quit | 'f' to toggle fullscreen | 'r' to reset size"
-        if arduino_connected:
-            instructions += " | 's' for emergency stop"
-        cv2.putText(frame, instructions, (10, frame.shape[0] - 20), 
-                   cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
-        
-        # Display the frame (no fullscreen by default for Pi performance)
-        cv2.imshow('Live Human Detection - Pi 4 Optimized', frame)
-        
-        # Update statistics
-        total_detections += len(detections)
-        frame_count += 1
-        
-        # Print progress every 30 frames
-        if frame_count % 30 == 0:
-            if detections:
-                detection = detections[0]
-                robot_command = get_robot_command(detection)
-                pwm_command = motor_interface.get_pwm_command_from_detection(detection) if arduino_connected else "NO ARDUINO"
-                real_distance = detection['estimated_real_distance_cm']
-                pixel_distance = detection['pixel_distance_to_center']
-                speed = detection['movement_speed_pixels_per_sec']
-                total_traveled = detection['total_distance_traveled']
+                    distance_cm = float('inf')
+
+                # Distance category
+                if distance_cm < args.close_cm:
+                    dist_state = "Close"
+                elif distance_cm > args.far_cm:
+                    dist_state = "Far"
+                else:
+                    dist_state = "Idle"  # within band
                 
-                if real_distance is not None:
-                    print(f"Frame {frame_count}: {detection['position']} | {detection['distance']} | {detection['movement']} | Distance: {real_distance:.1f}cm | Speed: {speed:.1f}px/s | Total: {total_traveled:.1f}px | Robot: {robot_command} | PWM: {pwm_command} | FPS: {fps:.1f}")
+
+
+                # Horizontal position with percentage-based indicators
+                frame_h, frame_w = frame.shape[:2]
+                margin = args.center_margin * frame_w
+                
+                # Calculate percentage from center (0% = center, 100% = edge)
+                center_x = frame_w / 2
+                max_offset = frame_w / 2  # Distance from center to edge
+                offset_from_center = abs(cx - center_x)
+                percentage_from_center = min(100, (offset_from_center / max_offset) * 100)
+                
+                # Determine position and intensity
+                if cx < center_x - margin:
+                    # Left side
+                    if percentage_from_center < 33:
+                        horiz_state = "Slightly Left"
+                    elif percentage_from_center < 60:
+                        horiz_state = "Left"
+                    elif percentage_from_center < 85:
+                        horiz_state = "Very Left"
+                    else:
+                        horiz_state = "Full Left"
+                elif cx > center_x + margin:
+                    # Right side
+                    if percentage_from_center < 33:
+                        horiz_state = "Slightly Right"
+                    elif percentage_from_center < 60:
+                        horiz_state = "Right"
+                    elif percentage_from_center < 85:
+                        horiz_state = "Very Right"
+                    else:
+                        horiz_state = "Full Right"
                 else:
-                    print(f"Frame {frame_count}: {detection['position']} | {detection['distance']} | {detection['movement']} | Pixel: {pixel_distance:.0f}px | Speed: {speed:.1f}px/s | Total: {total_traveled:.1f}px | Robot: {robot_command} | PWM: {pwm_command} | FPS: {fps:.1f}")
-            else:
-                print(f"Frame {frame_count}: No detection | Robot: SEARCHING | PWM: PWM:0,0,S | FPS: {fps:.1f}")
+                    # Center
+                    horiz_state = "Center"
+
+                # Movement (idle) check for the first detected person only
+                motion_state = "Moving"
+                if prev_center is not None:
+                    dx = cx - prev_center[0]
+                    dy = cy - prev_center[1]
+                    dist_moved = math.hypot(dx, dy)
+                    if dist_moved < args.idle_thresh:
+                        motion_state = "Idle"
+                prev_center = (cx, cy)
+                
+                # Elevator music control
+                if motion_state == "Idle" and not music_playing:
+                    # Start elevator music when person becomes idle
+                    music_thread = threading.Thread(target=play_elevator_music)
+                    music_thread.daemon = True
+                    music_thread.start()
+                    music_playing = True
+                    print("🎵 Elevator music started (person idle)")
+                elif motion_state == "Moving" and music_playing:
+                    # Stop elevator music when person starts moving
+                    stop_elevator_music()
+                    music_playing = False
+                    print("🔇 Elevator music stopped (person moving)")
+                
+                last_motion_state = motion_state
+
+                # Determine motor command automatically when person is detected
+                motor_command = determine_motor_command(horiz_state, dist_state, motion_state)
+
+                label = f"{horiz_state} ({percentage_from_center:.0f}%) | {dist_state} {distance_cm:.0f}cm | {motion_state} | CMD:{motor_command}"
+
+                # Draw rectangle and label
+                cv2.rectangle(frame, (x1, y1), (x2, y2), (0, 255, 0), 2)
+                (w, h), _ = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.6, 2)
+                cv2.rectangle(frame, (x1, y1 - h - 10), (x1 + w, y1), (0, 255, 0), -1)
+                cv2.putText(frame, label, (x1, y1 - 5), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 0), 2)
+
+            # Send motor command if changed or if no person detected
+            if not person_detected:
+                motor_command = "S"  # Stop if no person detected
+                # Stop elevator music when no person detected
+                if music_playing:
+                    stop_elevator_music()
+                    music_playing = False
+                    print("🔇 Elevator music stopped (no person detected)")
+            
+
+            
+            if motor_command != last_command or command_cooldown <= 0:
+                send_motor_command(ser, motor_command)
+                last_command = motor_command
+                command_cooldown = 10  # Send command every 10 frames
+
+            command_cooldown -= 1
+
+            # Draw zone markers
+            frame_height, frame_width = frame.shape[:2]
+            center_start = int(frame_width * (0.5 - args.center_margin))
+            center_end = int(frame_width * (0.5 + args.center_margin))
+            
+            # Draw vertical lines for zone boundaries
+            cv2.line(frame, (center_start, 0), (center_start, frame_height), (255, 255, 0), 2)  # Yellow
+            cv2.line(frame, (center_end, 0), (center_end, frame_height), (255, 255, 0), 2)     # Yellow
+            
+            # Add zone labels with percentage ranges
+            cv2.putText(frame, "LEFT (33-100%)", (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 255), 2)
+            cv2.putText(frame, "CENTER (0-33%)", (center_start + 10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
+            cv2.putText(frame, "RIGHT (33-100%)", (center_end + 10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 255), 2)
+            
+            # Add distance zone info
+            cv2.putText(frame, f"Close: <{args.close_cm}cm", (10, frame_height - 80), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 255), 2)
+            cv2.putText(frame, f"Idle: {args.close_cm}-{args.far_cm}cm", (10, frame_height - 60), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2)
+            cv2.putText(frame, f"Far: >{args.far_cm}cm", (10, frame_height - 40), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 0, 0), 2)
+            
+            # Add position percentage legend
+            cv2.putText(frame, "Position: Slightly(0-33%) | Normal(33-60%) | Very(60-85%) | Full(85-100%)", (10, frame_height - 20), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
+            
+            # Add motor command display
+            cv2.putText(frame, f"Motor: {motor_command}", (frame_width - 150, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 255), 2)
+            
+            # Add following status
+            cv2.putText(frame, f"Following: {'ON' if person_detected else 'OFF'}", (10, frame_height - 100), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 0), 2)
+            
+            # Add music status
+            music_status = "🎵 Music: ON" if music_playing else "🔇 Music: OFF"
+            cv2.putText(frame, music_status, (10, frame_height - 120), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 255), 2)
+            
+            # Display the frame
+            cv2.imshow("Human Detection (press 'q' to quit)", frame)
+            if cv2.waitKey(1) & 0xFF == ord("q"):
+                break
+    finally:
+        # Stop motors before exiting
+        if ser:
+            send_motor_command(ser, "S")
+            ser.close()
         
-        # Handle key presses
-        key = cv2.waitKey(1) & 0xFF
-        if key == ord('q'):
-            break
-        elif key == ord('f'):  # Toggle fullscreen
-            current_prop = cv2.getWindowProperty('Live Human Detection - Pi 4 Optimized', cv2.WND_PROP_FULLSCREEN)
-            if current_prop == cv2.WINDOW_FULLSCREEN:
-                cv2.setWindowProperty('Live Human Detection - Pi 4 Optimized', cv2.WND_PROP_FULLSCREEN, cv2.WINDOW_NORMAL)
-            else:
-                cv2.setWindowProperty('Live Human Detection - Pi 4 Optimized', cv2.WND_PROP_FULLSCREEN, cv2.WINDOW_FULLSCREEN)
-        elif key == ord('r'):  # Reset window size
-            cv2.setWindowProperty('Live Human Detection - Pi 4 Optimized', cv2.WND_PROP_FULLSCREEN, cv2.WINDOW_NORMAL)
-            cv2.resizeWindow('Live Human Detection - Pi 4 Optimized', 640, 480)
-        elif key == ord('s') and arduino_connected:  # Emergency stop
-            motor_interface.emergency_stop()
-            print("EMERGENCY STOP triggered by 's' key")
-    
-    camera_interface.release()
-    cv2.destroyAllWindows()
-    
-    # Emergency stop and disconnect motor interface
-    if arduino_connected:
-        motor_interface.emergency_stop()
-        motor_interface.disconnect()
-        print("Motor control disconnected")
-    
-    # Print final statistics
-    elapsed_time = time.time() - start_time
-    print(f"\nLive Human Detection Complete!")
-    print(f"Total frames processed: {frame_count}")
-    print(f"Total detections: {total_detections}")
-    print(f"Time elapsed: {elapsed_time:.1f} seconds")
-    if frame_count > 0:
-        print(f"Average detections per frame: {total_detections/frame_count:.2f}")
-        print(f"Average FPS: {frame_count/elapsed_time:.1f}")
+        # Stop elevator music before exiting
+        stop_elevator_music()
+        
+        cap.release()
+        cv2.destroyAllWindows()
+
 
 if __name__ == "__main__":
-    main() 
+    main()
